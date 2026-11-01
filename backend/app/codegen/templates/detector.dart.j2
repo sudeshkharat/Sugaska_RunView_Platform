@@ -1,0 +1,2233 @@
+import 'dart:io';
+{% if classifier_enabled %}
+import 'dart:math' as math;
+{% endif %}
+import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:image/image.dart' as img;
+import 'package:tflite_flutter/tflite_flutter.dart';
+{% if ocr_enabled %}
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
+{% endif %}
+{% if ocr_enabled and ocr_uses_crnn %}
+import 'dart:convert';
+import 'line_normalizer.dart';
+{% if ocr_class_engine != 'cnn' %}
+import 'ctc_decoder.dart';
+{% endif %}
+{% endif %}
+import 'detection_result.dart';
+
+/// Letterboxed model input plus the mapping needed to undo it when turning
+/// model coordinates back into image coordinates.
+class _LetterboxResult {
+  final Float32List buffer;
+  final int padX, padY, unpadW, unpadH;
+  const _LetterboxResult(this.buffer, this.padX, this.padY, this.unpadW, this.unpadH);
+}
+
+class ModelManager {
+  static final ModelManager _instance = ModelManager._internal();
+  factory ModelManager() => _instance;
+  ModelManager._internal();
+
+  Interpreter? _interpreter;
+  List<String> _labels = [];
+  String? _currentModelPath;
+  String? _currentLabelsPath;
+  bool _isLoaded = false;
+{% if ocr_use_charonly_detector %}
+  // Class-agnostic localization-only detector (ai-vision-platform's
+  // train-seed with class_agnostic=True) -- a second, independent
+  // interpreter run alongside the main task detector. Its boxes are all
+  // "char"/"plate" with no character identity, so it's only ever used to
+  // find WHERE the characters are; the CNN classifier is what reads WHICH
+  // character each one is (see _runOcrOnBbox).
+  Interpreter? _charOnlyInterpreter;
+  List<String> _charOnlyLabels = [];
+  bool _charOnlyLoaded = false;
+{% endif %}
+{% if ocr_enabled %}
+  // Character boxes are tiny next to whole-object detections and score far
+  // lower, so the app-wide default (0.5) finds the plate but drops its
+  // characters -- and without character boxes the recognizer never gets the
+  // tight line crop it is trained on. The standalone OCR pipeline has always
+  // detected at 0.25 for exactly this reason; match it.
+  double confidenceThreshold = {{ ocr_detector_threshold }};
+{% else %}
+  double confidenceThreshold = {{ confidence_threshold }};
+{% endif %}
+
+  bool get isLoaded => _isLoaded;
+
+  int get labelsCount => _labels.length;
+
+{% if ocr_enabled %}
+  /// Per-class OCR config: className -> target text ('' = no target, just
+  /// read and record the text -- OCR still runs, there's simply nothing to
+  /// pass/fail against). A class present here has OCR enabled at all;
+  /// absence means OCR never runs for that class.
+  static const Map<String, String> _classOcrTargets = {
+{% set seen_ocr = namespace(keys=[]) %}{% for task in models_manifest %}{% for cls, cfg in (task.classOcrConfig or {}).items() %}{% if cfg.ocrEnabled and cls not in seen_ocr.keys %}{% set seen_ocr.keys = seen_ocr.keys + [cls] %}
+    '{{ cls }}': '{{ cfg.ocrTargetText | default("", true) }}',
+{% endif %}{% endfor %}{% endfor %}
+  };
+
+  /// Per-class OCR reading engine: 'crnn' (this project's trained model,
+  /// falling back to ML Kit only if a target is set and the CRNN read
+  /// doesn't match it) or 'mlkit' (generic ML Kit only, matched against
+  /// target text -- the original behavior). Defaults to 'mlkit' when a
+  /// class has no explicit ocrEngine -- true for every class configured
+  /// before this option existed, so rebuilding an existing app keeps doing
+  /// exactly what it always did. The app builder UI now always writes
+  /// 'crnn' explicitly for any class configured or edited going forward.
+  static const Map<String, String> _classOcrEngine = {
+{% set seen_engine = namespace(keys=[]) %}{% for task in models_manifest %}{% for cls, cfg in (task.classOcrConfig or {}).items() %}{% if cfg.ocrEnabled and cls not in seen_engine.keys %}{% set seen_engine.keys = seen_engine.keys + [cls] %}
+    '{{ cls }}': '{{ cfg.ocrEngine | default("mlkit", true) }}',
+{% endif %}{% endfor %}{% endfor %}
+  };
+
+  /// Classes configured to check their OCR read against whatever code was
+  /// scanned to reach this inspection (the VIN/engine-serial/Chakan VIN from
+  /// the Scan Type step), instead of one fixed _classOcrTargets string --
+  /// e.g. "does the engine-plate stamp actually match the engine number we
+  /// scanned to get here." A per-inspection value, so unlike the maps above
+  /// it can't be a compile-time const -- see scanTruthValue below.
+  static const Set<String> _classesUsingScanTruth = {
+{% set seen_scan_truth = namespace(keys=[]) %}{% for task in models_manifest %}{% for cls, cfg in (task.classOcrConfig or {}).items() %}{% if cfg.ocrEnabled and cfg.ocrTruthSource == 'scan' and cls not in seen_scan_truth.keys %}{% set seen_scan_truth.keys = seen_scan_truth.keys + [cls] %}
+    '{{ cls }}',
+{% endif %}{% endfor %}{% endfor %}
+  };
+
+  /// The code scanned to reach this inspection (Scan Type step's VIN or
+  /// engine serial) -- set once per inspection via [setScanTruthValue]
+  /// before detection runs, and used as the OCR target for any class in
+  /// [_classesUsingScanTruth] instead of its fixed _classOcrTargets entry.
+  String? _scanTruthValue;
+
+  void setScanTruthValue(String? value) {
+    _scanTruthValue = value;
+  }
+
+  // ── OCR preprocessing ─────────────────────────────────────────────────────
+
+  /// Upscale 3x, grayscale, adaptive threshold (per-tile), sharpen.
+  /// Adaptive thresholding divides the image into tiles and finds the optimal
+  /// black/white cutoff per tile — handles uneven lighting and reflections on
+  /// metallic stickers far better than a single global threshold.
+  static img.Image _preprocessForOcr(img.Image src, {bool invert = false}) {
+    // 1. Upscale 3x
+    img.Image out = img.copyResize(
+      src,
+      width: src.width * 3,
+      height: src.height * 3,
+      interpolation: img.Interpolation.cubic,
+    );
+
+    // 2. Grayscale
+    out = img.grayscale(out);
+
+    // 3. Adaptive thresholding — tile size ~15% of image width, min 16px
+    final int w = out.width;
+    final int h = out.height;
+    final int tileSize = (w * 0.15).round().clamp(16, 64);
+    final img.Image thresholded = img.Image(width: w, height: h);
+
+    for (int ty = 0; ty < h; ty += tileSize) {
+      for (int tx = 0; tx < w; tx += tileSize) {
+        final int x1 = tx;
+        final int y1 = ty;
+        final int x2 = (tx + tileSize).clamp(0, w);
+        final int y2 = (ty + tileSize).clamp(0, h);
+
+        // Find mean luminance in this tile
+        int sum = 0, count = 0;
+        for (int y = y1; y < y2; y++) {
+          for (int x = x1; x < x2; x++) {
+            sum += out.getPixel(x, y).r.toInt();
+            count++;
+          }
+        }
+        final int mean = count > 0 ? (sum ~/ count) : 128;
+        // Threshold slightly below mean to favour text pixels
+        final int tileThreshold = (mean * 0.85).round().clamp(0, 255);
+
+        // Apply threshold to tile
+        for (int y = y1; y < y2; y++) {
+          for (int x = x1; x < x2; x++) {
+            final int lum = out.getPixel(x, y).r.toInt();
+            int val = lum < tileThreshold ? 0 : 255;
+            if (invert) val = 255 - val;
+            thresholded.setPixelRgb(x, y, val, val, val);
+          }
+        }
+      }
+    }
+
+    // 4. Sharpen
+    img.Image sharpened = img.convolution(
+      thresholded,
+      filter: [0, -1, 0, -1, 5, -1, 0, -1, 0],
+      div: 1,
+    );
+
+    return sharpened;
+  }
+
+  /// Isolate entry-point for [_preprocessForOcr] + PNG encode.
+  ///
+  /// The preprocessing chain is 3x upscale -> per-tile adaptive threshold ->
+  /// convolution, then a PNG encode of the upscaled result -- hundreds of ms
+  /// on a real crop, and it ran inline on the UI isolate, twice (normal and
+  /// inverted), while the camera preview was still streaming. That is a
+  /// direct cause of the capture-time freeze and camera buffer backlog. Only
+  /// the ML Kit call itself has to stay on the main isolate (platform
+  /// channels aren't available to a background isolate without extra
+  /// plumbing); the expensive pixel work does not.
+  static Uint8List _preprocessForOcrIsolate(Map<String, dynamic> args) {
+    final crop = img.decodeImage(args['cropPng'] as Uint8List);
+    if (crop == null) return Uint8List(0);
+    return Uint8List.fromList(
+      img.encodePng(_preprocessForOcr(crop, invert: args['invert'] as bool)),
+    );
+  }
+
+  // ── OCR text helpers ───────────────────────────────────────────────────────
+
+  /// Strip non-alphanumeric, uppercase, apply common OCR substitutions.
+  static String _normalizeOcr(String s) =>
+      s.toUpperCase().replaceAll(RegExp(r'[^A-Z0-9]'), '');
+
+  /// Levenshtein edit distance between two strings.
+  static int _levenshtein(String a, String b) {
+    if (a.isEmpty) return b.length;
+    if (b.isEmpty) return a.length;
+    final List<List<int>> dp = List.generate(
+      a.length + 1, (i) => List.generate(b.length + 1, (j) => i == 0 ? j : (j == 0 ? i : 0)),
+    );
+    for (int i = 1; i <= a.length; i++) {
+      for (int j = 1; j <= b.length; j++) {
+        dp[i][j] = a[i - 1] == b[j - 1]
+            ? dp[i - 1][j - 1]
+            : 1 + [dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]].reduce((x, y) => x < y ? x : y);
+      }
+    }
+    return dp[a.length][b.length];
+  }
+
+  /// Best Levenshtein similarity using a sliding window across extracted text.
+  /// Handles extra surrounding chars, noise, and single-char misreads.
+  static double _ocrSimilarity(String extracted, String target) {
+    if (target.isEmpty) return 1.0;
+    if (extracted.isEmpty) return 0.0;
+    if (extracted == target) return 1.0;
+    // Slide window of target.length across extracted
+    double best = 0;
+    final len = target.length;
+    for (int start = 0; start <= extracted.length - len; start++) {
+      final window = extracted.substring(start, start + len);
+      final dist = _levenshtein(window, target);
+      final score = 1.0 - dist / len;
+      if (score > best) best = score;
+    }
+    // Also try full extracted vs target when extracted is shorter
+    if (extracted.length < len) {
+      final dist = _levenshtein(extracted, target);
+      final score = 1.0 - dist / len;
+      if (score > best) best = score;
+    }
+    return best;
+  }
+
+  // ── Run OCR on single image bytes ─────────────────────────────────────────
+
+  static Future<String> _ocrBytes(Uint8List pngBytes, Directory tempDir, String name) async {
+    final tempFile = File('${tempDir.path}/$name.png');
+    await tempFile.writeAsBytes(pngBytes);
+    try {
+      final inputImage = InputImage.fromFilePath(tempFile.path);
+      final recognizer = TextRecognizer(script: TextRecognitionScript.latin);
+      final result = await recognizer.processImage(inputImage);
+      recognizer.close();
+      return result.text.replaceAll('\n', ' ').trim();
+    } catch (e) {
+      debugPrint('[OCR] error: $e');
+      return '';
+    }
+  }
+
+{% if ocr_uses_crnn %}
+  // ── CRNN recognizer (per-class OCR reading, not the whole-image detector
+  // above) -- a second, independent interpreter, since the class it reads
+  // from is already known (found by the main detector); no plate/char
+  // detection of its own is needed, just normalize + CTC decode. Reuses
+  // LineNormalizer/CtcDecoder verbatim from the standalone OCR app type.
+
+  Interpreter? _ocrInterpreter;
+  List<String> _ocrCharset = [];
+  int _ocrBlankIndex = -1;
+  bool _ocrModelLoaded = false;
+  // Set on load failure, cleared on success -- surfaced on-screen (not just
+  // debugPrint) because the debug console scrolls fast enough during a live
+  // capture session that this one-time startup message reliably gets
+  // missed/screenshotted-past, making "did the classifier even load" the
+  // single most argued-about fact in a long debugging back-and-forth that a
+  // permanent on-screen badge settles in one glance.
+  String? ocrLoadError;
+  bool get isOcrModelLoaded => _ocrModelLoaded;
+
+  Future<void> loadOcrModel(String modelPath, String charsetPath, {String? metaPath}) async {
+    if (_ocrModelLoaded) return;
+    try {
+      _ocrInterpreter = await Interpreter.fromAsset(modelPath);
+      final charsetData = await rootBundle.loadString(charsetPath);
+      _ocrCharset = charsetData.split('\n').map((l) => l.trim()).where((l) => l.isNotEmpty).toList();
+      _ocrBlankIndex = _ocrCharset.length;
+      if (metaPath != null) {
+        try {
+          final metaData = await rootBundle.loadString(metaPath);
+          final meta = jsonDecode(metaData) as Map<String, dynamic>;
+          if (meta['charset'] is List) {
+            _ocrCharset = (meta['charset'] as List).map((e) => e.toString()).toList();
+          }
+          if (meta['blank_index'] is int) {
+            _ocrBlankIndex = meta['blank_index'] as int;
+          }
+        } catch (e) {
+          debugPrint('[OCR] Could not parse OCR meta.json, using charset.txt defaults: $e');
+        }
+      }
+      if (_ocrCharset.isEmpty) {
+        ocrLoadError = 'Charset file loaded but is empty ($charsetPath) -- classifier has no labels to predict.';
+        debugPrint('[OCR] $ocrLoadError');
+        return;
+      }
+      _ocrModelLoaded = true;
+      ocrLoadError = null;
+      debugPrint('[OCR] CRNN recognizer loaded: $modelPath (${_ocrCharset.length} chars)');
+    } catch (e) {
+      ocrLoadError = 'Failed to load "$modelPath" or "$charsetPath": $e';
+      debugPrint('[OCR] Error loading CRNN recognizer: $e');
+    }
+  }
+
+{% if ocr_class_engine != 'cnn' %}
+  /// Runs the actual CRNN read (normalize + interpreter.run + CTC decode) on
+  /// a background isolate via compute(), the same pattern the main YOLO
+  /// detector already uses (_runInferencePng/_runInferenceBytes below) --
+  /// this used to run inline here on the UI isolate, once per matched
+  /// detection box. An inspection class with several OCR-enabled boxes (or
+  /// several single-character boxes reaching this path) meant several
+  /// sequential native TFLite calls blocking the UI isolate back-to-back --
+  /// that's what froze the camera preview and, on slower devices or with
+  /// enough boxes, could starve the platform channel long enough to look
+  /// like a crash. img.Image can't cross the isolate boundary (same reason
+  /// predictImage/predictBytes below PNG-encode first), so the crop is
+  /// PNG-encoded here and decoded again on the other side.
+  static Future<String?> _readWithCrnn(Interpreter interpreter, List<String> charset, int blankIndex, img.Image crop) async {
+    final cropPngBytes = Uint8List.fromList(img.encodePng(crop));
+    try {
+      return await compute(_runCrnnInference, {
+        'cropPngBytes': cropPngBytes,
+        'interpreter_address': interpreter.address,
+        'charset': charset,
+        'blankIndex': blankIndex,
+      });
+    } catch (e) {
+      debugPrint('[OCR][CRNN] inference failed: $e');
+      return null;
+    }
+  }
+
+  /// Isolate entry-point for the CRNN read. Validates the input tensor shape
+  /// against what this crop was actually normalized to before ever calling
+  /// interpreter.run() -- a mismatched recognizer (attached .tflite trained
+  /// with different image dimensions than ocr_line_img_h/w, or a bundle
+  /// that isn't really a single-line CRNN with this input layout) used to
+  /// reach interpreter.run() completely unchecked. TFLite's native layer can
+  /// hard-abort the process on a shape mismatch instead of throwing a
+  /// catchable Dart exception -- exactly the kind of crash that shows no
+  /// error banner and just kills the app. Now it's a clear debug log and a
+  /// skipped read (falls through to ML Kit when a target is configured)
+  /// instead.
+  static String? _runCrnnInference(Map<String, dynamic> args) {
+    final Uint8List cropPngBytes = args['cropPngBytes'] as Uint8List;
+    final int interpreterAddress = args['interpreter_address'] as int;
+    final List<String> charset = List<String>.from(args['charset'] as List);
+    final int blankIndex = args['blankIndex'] as int;
+
+    final crop = img.decodePng(cropPngBytes);
+    if (crop == null) return null;
+
+    final interpreter = Interpreter.fromAddress(interpreterAddress);
+    const normalizer = LineNormalizer();
+    final normalized = normalizer.normalize(crop);
+
+    final inputTensorShape = interpreter.getInputTensor(0).shape;
+    if (inputTensorShape.length != 4 ||
+        inputTensorShape[1] != normalizer.imgH ||
+        inputTensorShape[2] != normalizer.imgW) {
+      debugPrint('[OCR][CRNN] input shape mismatch: model expects $inputTensorShape, '
+          'normalizer produces [1, ${normalizer.imgH}, ${normalizer.imgW}, 1] -- skipping '
+          'read instead of risking a native crash. Check the recognizer bundle\'s meta.json '
+          '(or ocr_line_img_h/ocr_line_img_w) against the actual attached .tflite.');
+      return null;
+    }
+
+    final input = normalized.reshape([1, normalizer.imgH, normalizer.imgW, 1]);
+    final shape = interpreter.getOutputTensor(0).shape; // [1, T, C]
+    if (shape.length != 3) return null;
+    final output = List.generate(shape[0], (_) => List.generate(shape[1], (_) => List.filled(shape[2], 0.0)));
+    interpreter.run(input, output);
+    final decoder = CtcDecoder(charset: charset, blankIndex: blankIndex);
+    return decoder.decode(output[0]);
+  }
+{% else %}
+  /// Classifies every character box inside [charBoxes] with the trained
+  /// per-character TensorFlow model in one background-isolate round trip --
+  /// the CNN engine has no CTC/line-reading step, each character box the
+  /// main detector already found gets its own independent classification,
+  /// same as the standalone OCR app's 'cnn' engine (ocr_recognizer.dart's
+  /// _recognizeWithCnn/_extractCharCrop) and the training tool's own CNN
+  /// test panel. Crop extraction happens here on the calling isolate (it
+  /// needs img.Image, which can't cross the isolate boundary) and only the
+  /// interpreter.run() calls happen in the background.
+  static Future<Map<String, dynamic>?> _classifyCharsCnn(
+    Interpreter interpreter,
+    List<String> charset,
+    img.Image source,
+    List<DetectionResult> charBoxes,
+  ) async {
+    if (charBoxes.isEmpty) {
+      debugPrint('[OCR][CNN] classifier skipped: no char boxes to classify');
+      return null;
+    }
+    // Every silent `return null` below used to be indistinguishable from
+    // "everything worked but read nothing" -- a shape mismatch or an
+    // interpreter that never actually loaded looked identical to a clean
+    // empty read from the outside. Logging the classifier's own declared
+    // tensor shapes here is the single most useful piece of information for
+    // telling those apart: it's either wrong (needs a differently-exported
+    // .tflite/labels file) or fine (the crops themselves are the problem).
+    final inputShape = interpreter.getInputTensor(0).shape; // expect [1, size, size, 1]
+    final outputShape = interpreter.getOutputTensor(0).shape; // expect [1, numClasses]
+    debugPrint('[OCR][CNN] classifier tensors: input=$inputShape output=$outputShape '
+        'charset=${charset.length} boxesToClassify=${charBoxes.length}');
+    if (inputShape.length != 4) {
+      debugPrint('[OCR][CNN] classifier skipped: input tensor rank ${inputShape.length} != 4 '
+          '(expected [1, size, size, channels] -- this .tflite is probably not a per-character '
+          'classifier, or was exported with an unexpected input layout)');
+      return null;
+    }
+    final size = inputShape[1];
+    final channels = inputShape[3];
+    if (channels != 1) {
+      debugPrint('[OCR][CNN] WARNING: classifier expects $channels input channel(s), but crops are '
+          'built as single-channel grayscale -- reads will likely be garbage. Re-export the '
+          'classifier with a single-channel (grayscale) input to match training.');
+    }
+
+    final crops = <Float32List>[];
+    final keptJson = <Map<String, dynamic>>[];
+    for (final c in charBoxes) {
+      final crop = _extractCharCropForClassifier(source, c, size);
+      if (crop == null) {
+        debugPrint('[OCR][CNN] skipped one char box: crop extraction failed '
+            '(box too small/degenerate after margin+clamp) bbox=${c.bbox}');
+        continue;
+      }
+      crops.add(crop);
+      keptJson.add(c.toJson());
+    }
+    if (crops.isEmpty) {
+      debugPrint('[OCR][CNN] classifier skipped: all ${charBoxes.length} char box(es) failed crop extraction');
+      return null;
+    }
+
+    try {
+      final result = await compute(_runCnnCharBatch, {
+        'crops': crops,
+        'interpreter_address': interpreter.address,
+        'charset': charset,
+        'size': size,
+        'boxesJson': keptJson,
+      });
+      debugPrint('[OCR][CNN] classifier produced: "${result['text']}" from ${crops.length} crop(s)');
+      return result;
+    } catch (e, st) {
+      debugPrint('[OCR][CNN] batch inference threw: $e\n$st');
+      return null;
+    }
+  }
+
+  /// Isolate entry-point for the CNN batch classify: one interpreter.run()
+  /// per character crop, argmax over the classifier's output, no CTC. Both
+  /// the read text and the per-character boxes (now carrying the *predicted*
+  /// class + confidence, not the detector's raw box label) come back so the
+  /// caller can show them on screen and overlay them on the photo.
+  static Map<String, dynamic> _runCnnCharBatch(Map<String, dynamic> args) {
+    final crops = List<Float32List>.from(args['crops'] as List);
+    final interpreterAddress = args['interpreter_address'] as int;
+    final charset = List<String>.from(args['charset'] as List);
+    final size = args['size'] as int;
+    final boxesJson = List<Map<String, dynamic>>.from(
+        (args['boxesJson'] as List).map((e) => Map<String, dynamic>.from(e as Map)));
+
+    final interpreter = Interpreter.fromAddress(interpreterAddress);
+    final numClasses = interpreter.getOutputTensor(0).shape.last;
+
+    final buffer = StringBuffer();
+    final charBoxesOut = <Map<String, dynamic>>[];
+    for (var i = 0; i < crops.length; i++) {
+      final input = crops[i].reshape([1, size, size, 1]);
+      final output = List.generate(1, (_) => List<double>.filled(numClasses, 0.0));
+      interpreter.run(input, output);
+      final probs = output[0];
+
+      var best = 0;
+      var bestScore = probs[0];
+      for (var c = 1; c < probs.length; c++) {
+        if (probs[c] > bestScore) {
+          bestScore = probs[c];
+          best = c;
+        }
+      }
+      final ch = (best >= 0 && best < charset.length) ? charset[best] : '?';
+      buffer.write(ch);
+      charBoxesOut.add({...boxesJson[i], 'className': ch, 'confidence': bestScore});
+    }
+    return {'text': buffer.toString(), 'charBoxes': charBoxesOut};
+  }
+
+  /// Ports `_extract_char_crop` (ai-vision-platform's ocr_training.py) /
+  /// `OcrRecognizer._extractCharCrop`: margin, grayscale, contrast
+  /// enhancement, aspect-preserving resize onto a square canvas padded with
+  /// the crop's own edge-median value -- the classifier was trained on crops
+  /// built exactly this way, not a plain resize.
+  static Float32List? _extractCharCropForClassifier(
+    img.Image source,
+    DetectionResult det,
+    int size, {
+    double margin = 0.12,
+  }) {
+    final bx = (det.bbox.left * source.width).round();
+    final by = (det.bbox.top * source.height).round();
+    final bw = (det.bbox.width * source.width).round();
+    final bh = (det.bbox.height * source.height).round();
+    final mx = (bw * margin).round();
+    final my = (bh * margin).round();
+    final x1 = (bx - mx).clamp(0, source.width - 1);
+    final y1 = (by - my).clamp(0, source.height - 1);
+    final x2 = (bx + bw + mx).clamp(0, source.width);
+    final y2 = (by + bh + my).clamp(0, source.height);
+    if (x2 - x1 < 2 || y2 - y1 < 2) return null;
+
+    final cropped = img.copyCrop(source, x: x1, y: y1, width: x2 - x1, height: y2 - y1);
+    final gray = img.grayscale(cropped);
+    // CLAHE, not global histogram equalization -- matches
+    // ai-vision-platform's actual training/inference preprocessing exactly
+    // (cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4,4)) in
+    // _extract_char_crop). The classifier was trained exclusively on CLAHE
+    // crops; a global equalization here is a real train/inference mismatch,
+    // not just a weaker approximation.
+    final enhanced = LineNormalizer.claheApprox(gray);
+
+    final ch = enhanced.height, cw = enhanced.width;
+    final scale = size / (ch > cw ? ch : cw);
+    final nw = (cw * scale).round().clamp(1, size);
+    final nh = (ch * scale).round().clamp(1, size);
+    final resized = img.copyResize(enhanced, width: nw, height: nh, interpolation: img.Interpolation.average);
+
+    final edge = <int>[];
+    for (var x = 0; x < nw; x++) {
+      edge.add(resized.getPixel(x, 0).r.toInt());
+      edge.add(resized.getPixel(x, nh - 1).r.toInt());
+    }
+    for (var y = 0; y < nh; y++) {
+      edge.add(resized.getPixel(0, y).r.toInt());
+      edge.add(resized.getPixel(nw - 1, y).r.toInt());
+    }
+    edge.sort();
+    final padVal = edge.isEmpty ? 255 : edge[edge.length ~/ 2];
+
+    final canvas = img.Image(width: size, height: size);
+    img.fill(canvas, color: img.ColorRgb8(padVal, padVal, padVal));
+    final y0 = (size - nh) ~/ 2;
+    final x0 = (size - nw) ~/ 2;
+    img.compositeImage(canvas, resized, dstX: x0, dstY: y0);
+
+    final out = Float32List(size * size);
+    var idx = 0;
+    for (var y = 0; y < size; y++) {
+      for (var x = 0; x < size; x++) {
+        out[idx++] = canvas.getPixel(x, y).r.toDouble() / 255.0;
+      }
+    }
+    return out;
+  }
+{% endif %}
+
+{% if ocr_class_engine != 'cnn' %}
+  /// The tight text-line crops inside [region]'s box -- one per reading row --
+  /// built from the single-character-class boxes the detector found inside it.
+  /// Returns empty when there are none, letting the caller fall back to the
+  /// whole-region crop.
+  ///
+  /// This is the piece the multiclass inspection path was missing entirely:
+  /// the standalone OCR pipeline has always narrowed the plate box down to
+  /// the actual character rows before reading, and the recognizer is trained
+  /// on exactly those tight line crops.
+  static List<img.Image> _lineCropsInsideRegion(
+    DetectionResult region,
+    List<DetectionResult> all,
+    img.Image source,
+  ) {
+    // Real characters are inside the region box by construction -- that is
+    // how the training data is labeled -- so a single-character detection
+    // outside it is noise (a scratch, a reflection, an adjacent surface
+    // feature that scored above threshold) and would otherwise drag junk
+    // pixels into the line crop and invent extra characters.
+    final chars = all
+        .where((d) =>
+            d.className.trim().length == 1 && _containmentNorm(d, region) >= 0.5)
+        .toList();
+    if (chars.isEmpty) return const [];
+
+    final crops = <img.Image>[];
+    for (final row in _groupIntoCharRows(chars)) {
+      double minL = 1.0, minT = 1.0, maxR = 0.0, maxB = 0.0;
+      for (final b in row) {
+        if (b.bbox.left < minL) minL = b.bbox.left;
+        if (b.bbox.top < minT) minT = b.bbox.top;
+        if (b.bbox.right > maxR) maxR = b.bbox.right;
+        if (b.bbox.bottom > maxB) maxB = b.bbox.bottom;
+      }
+      // Same few px of breathing room around the row the standalone
+      // pipeline leaves, so strokes aren't clipped at the crop edge.
+      final int x1 = ((minL * source.width).round() - 4).clamp(0, source.width - 1);
+      final int y1 = ((minT * source.height).round() - 4).clamp(0, source.height - 1);
+      final int x2 = ((maxR * source.width).round() + 4).clamp(1, source.width);
+      final int y2 = ((maxB * source.height).round() + 4).clamp(1, source.height);
+      if (x2 - x1 < 2 || y2 - y1 < 2) continue;
+      crops.add(img.copyCrop(source, x: x1, y: y1, width: x2 - x1, height: y2 - y1));
+    }
+    return crops;
+  }
+{% else %}
+  /// The individual single-character-class detections inside [region], in
+  /// reading order -- unlike [_lineCropsInsideRegion] (which merges a row
+  /// into one shared line crop for the CRNN reader), the CNN engine
+  /// classifies every character crop on its own, so each box has to survive
+  /// individually instead of being flattened into a row rectangle.
+  static List<DetectionResult> _charBoxesInsideRegion(
+    DetectionResult region,
+    List<DetectionResult> all,
+  ) {
+    // Matches either a real per-character class (a genuine single-character
+    // detector, e.g. '0'-'9'/'A'-'Z') OR the generic 'char' class -- the
+    // main task detector itself can be a class-agnostic model (its own
+    // labels are just ['plate', 'char'], no real character identity),
+    // exactly like the separate detector _charBoxesInsideRegionAgnostic
+    // handles below. Without this, a class-agnostic main detector matched
+    // nothing here (no class has length 1) and produced an empty read even
+    // though its own boxes were right there in [all].
+    bool isCharClass(DetectionResult d) =>
+        d.className.trim().length == 1 || d.className.trim().toLowerCase() == 'char';
+
+    var chars = all
+        .where((d) => isCharClass(d) && _containmentNorm(d, region) >= 0.5)
+        .toList();
+    // ai-vision-platform's own CNN test panel (ocr.py's predict_ocr) never
+    // filters character boxes by plate containment at all -- it reads
+    // every 'char' box the detector found anywhere in the photo, trusting
+    // the detector's own classification instead of a geometric cross-check.
+    // The containment filter above is still worth trying first (it's a real
+    // win when the photo also frames unrelated background clutter the
+    // detector mistakes for characters), but if it throws away every char
+    // box -- most likely the plate box just doesn't tightly/correctly
+    // enclose them -- falling back to every char box in the frame matches
+    // the reference implementation's actual, proven-accurate behavior
+    // instead of returning an empty read over a geometry mismatch.
+    if (chars.isEmpty) {
+      chars = all.where(isCharClass).toList();
+    }
+    if (chars.isEmpty) return const [];
+    // A 'char'-class box carries no identity of its own -- reset to '?' so
+    // it never gets treated as a real (fabricated) character label if the
+    // classifier below doesn't override it. A genuine single-character
+    // class keeps its own label as the floor, same as before.
+    final normalized = chars
+        .map((d) => d.className.trim().toLowerCase() == 'char'
+            ? DetectionResult(className: '?', confidence: d.confidence, bbox: d.bbox)
+            : d)
+        .toList();
+    return _groupIntoCharRows(normalized).expand((row) => row).toList();
+  }
+{% if ocr_use_charonly_detector %}
+  /// Same as [_charBoxesInsideRegion], but for the class-agnostic
+  /// localization-only detector's output: every box is the generic "char"
+  /// class (no character identity of its own), so boxes are picked by class
+  /// name rather than by "is this a single-character label" -- and each
+  /// returned box's className is reset to '?' (a visible placeholder,
+  /// never a claim about what character it is) since there is nothing
+  /// meaningful to fall back to if the CNN classifier fails to read it.
+  static List<DetectionResult> _charBoxesInsideRegionAgnostic(
+    DetectionResult region,
+    List<DetectionResult> charOnlyDetections,
+  ) {
+    bool isChar(DetectionResult d) => d.className.trim().toLowerCase() == 'char';
+
+    var chars = charOnlyDetections.where((d) => isChar(d) && _containmentNorm(d, region) >= 0.5).toList();
+    // Same fallback as _charBoxesInsideRegion: ai-vision-platform's own CNN
+    // test panel never filters by plate containment at all, it reads every
+    // 'char' box found anywhere in the photo. Try containment first (useful
+    // when the photo also frames background clutter), but never let a
+    // plate-box geometry mismatch turn "characters were found" into "read
+    // nothing".
+    if (chars.isEmpty) {
+      chars = charOnlyDetections.where(isChar).toList();
+    }
+    if (chars.isEmpty) return const [];
+    return _groupIntoCharRows(chars)
+        .expand((row) => row)
+        .map((d) => DetectionResult(className: '?', confidence: d.confidence, bbox: d.bbox))
+        .toList();
+  }
+{% endif %}
+{% endif %}
+
+  /// Fraction of [inner]'s own area that falls inside [outer]. Unlike IoU,
+  /// this doesn't penalize the size gap between a small character box and a
+  /// much larger region box -- "is this character inside the plate" is
+  /// exactly the question being asked.
+  static double _containmentNorm(DetectionResult inner, DetectionResult outer) {
+    final l = inner.bbox.left > outer.bbox.left ? inner.bbox.left : outer.bbox.left;
+    final t = inner.bbox.top > outer.bbox.top ? inner.bbox.top : outer.bbox.top;
+    final r = inner.bbox.right < outer.bbox.right ? inner.bbox.right : outer.bbox.right;
+    final b = inner.bbox.bottom < outer.bbox.bottom ? inner.bbox.bottom : outer.bbox.bottom;
+    final iw = r > l ? r - l : 0.0;
+    final ih = b > t ? b - t : 0.0;
+    final innerArea = inner.bbox.width * inner.bbox.height;
+    return innerArea > 0 ? (iw * ih) / innerArea : 0.0;
+  }
+
+  /// Groups character boxes into row bands (top to bottom), each sorted left
+  /// to right -- i.e. reading order. Ports _groupIntoRows from
+  /// ocr_recognizer.dart so both pipelines assemble text identically.
+  static List<List<DetectionResult>> _groupIntoCharRows(List<DetectionResult> boxes) {
+    if (boxes.isEmpty) return const [];
+    final heights = boxes.map((b) => b.bbox.height).toList()..sort();
+    final mid = heights.length ~/ 2;
+    final medH = heights.length.isOdd
+        ? heights[mid]
+        : (heights[mid - 1] + heights[mid]) / 2;
+
+    double cy(DetectionResult b) => b.bbox.top + b.bbox.height / 2;
+    double rowCy(List<DetectionResult> row) =>
+        row.map(cy).reduce((p, q) => p + q) / row.length;
+
+    final sorted = List<DetectionResult>.from(boxes)
+      ..sort((a, b) => cy(a).compareTo(cy(b)));
+    final rows = <List<DetectionResult>>[];
+    for (final b in sorted) {
+      var placed = false;
+      for (final row in rows) {
+        if ((cy(b) - rowCy(row)).abs() < medH * 0.6) {
+          row.add(b);
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) rows.add([b]);
+    }
+    for (final row in rows) {
+      row.sort((a, b) => a.bbox.left.compareTo(b.bbox.left));
+    }
+    rows.sort((a, b) => rowCy(a).compareTo(rowCy(b)));
+    return rows;
+  }
+{% endif %}
+
+  /// Crops bbox, reads it, and returns an updated DetectionResult.
+  /// engine == 'crnn': this project's trained CRNN reads the crop directly;
+  /// if a target is configured and the CRNN read doesn't match it, ML Kit
+  /// gets one fallback attempt on the same crop before giving up.
+  /// engine == 'mlkit' (or unset): original behavior, unchanged -- generic
+  /// ML Kit on normal + inverted crops, matched against target text, and
+  /// (like before) skipped entirely when no target is configured, since
+  /// there's nothing to match against.
+  Future<DetectionResult> _runOcrOnBbox(
+    DetectionResult det,
+    img.Image source, {
+    List<DetectionResult> allDetections = const [],
+{% if ocr_use_charonly_detector %}
+    List<DetectionResult> charOnlyDetections = const [],
+{% endif %}
+  }) async {
+    if (!_classOcrTargets.containsKey(det.className)) return det;
+    final bool useScanTruth = _classesUsingScanTruth.contains(det.className) &&
+        (_scanTruthValue != null && _scanTruthValue!.isNotEmpty);
+    final String target = useScanTruth ? _scanTruthValue! : (_classOcrTargets[det.className] ?? '');
+    final String engine = _classOcrEngine[det.className] ?? 'mlkit';
+    if (engine != 'crnn' && target.isEmpty) return det;
+
+    final int x = (det.bbox.left * source.width).round().clamp(0, source.width - 1);
+    final int y = (det.bbox.top * source.height).round().clamp(0, source.height - 1);
+    final int w = (det.bbox.width * source.width).round().clamp(1, source.width - x);
+    final int h = (det.bbox.height * source.height).round().clamp(1, source.height - y);
+    final cropped = img.copyCrop(source, x: x, y: y, width: w, height: h);
+
+    // Survives the CRNN -> ML Kit fallback below so both engines' reads make
+    // it onto the result screen. Stays null when the CRNN never ran.
+    String? crnnReadForReport;
+    // Per-character boxes (predicted char + confidence), only ever populated
+    // by the CNN engine below -- declared out here (not inside the `if`
+    // block) so it also survives the fall-through to the ML Kit path and
+    // reaches every return statement below.
+    List<DetectionResult>? charBoxesForDisplay;
+
+{% if ocr_uses_crnn %}
+    if (engine == 'crnn' && _ocrModelLoaded && _ocrInterpreter != null) {
+{% if ocr_class_engine == 'cnn' %}
+{% if ocr_use_charonly_detector %}
+      // Per-character read, boxes from the class-agnostic localization-only
+      // detector (tighter on touching/engraved characters than the main
+      // per-class detector) -- see _charBoxesInsideRegionAgnostic. Every box
+      // starts labeled '?' since that detector carries no character
+      // identity at all; the CNN classifier is the ONLY source of the
+      // actual character here, not a refinement on top of a usable guess.
+      final charBoxes = _charBoxesInsideRegionAgnostic(det, charOnlyDetections);
+      // charOnlyDetections is EVERY box the class-agnostic detector found on
+      // the whole photo -- most of them are outside this plate. Logging the
+      // raw count vs. the containment-filtered count tells us whether the
+      // problem is "the two detectors don't agree on where the plate is" (raw
+      // 'char' count > 0 but charBoxes.length == 0) vs. "nothing to classify
+      // at all" (raw 'char' count == 0 too).
+      final rawCharOnlyCount = charOnlyDetections.where((d) => d.className.trim().toLowerCase() == 'char').length;
+      debugPrint('[OCR][CNN] region="${det.className}" bbox=${det.bbox} -- '
+          'charOnlyDetections total=${charOnlyDetections.length} raw "char" boxes=$rawCharOnlyCount, '
+          '${charBoxes.length} landed inside this region (>=50% containment)');
+{% else %}
+      // Per-character read. The main detector already classifies each
+      // character as its own box+class (chars + region class trained
+      // together) -- that raw per-character class IS a usable read on its
+      // own, and it's what History/the debug console already show working.
+      // The attached classifier model is only ever a *refinement* on top of
+      // that: it re-crops each character and re-classifies it, which can
+      // fail (wrong crop preprocessing, mismatched input size, a bundle
+      // that isn't really this shape) without the read becoming unusable --
+      // previously a classifier failure meant an empty final answer even
+      // though the detector's own labels were sitting right there. Now the
+      // detector's raw label is always the floor; the classifier's answer
+      // only replaces it when the classifier actually returned one for that
+      // exact position.
+      final charBoxes = _charBoxesInsideRegion(det, allDetections);
+{% endif %}
+      Map<String, dynamic>? cnnResult;
+      try {
+        cnnResult = await _classifyCharsCnn(_ocrInterpreter!, _ocrCharset, source, charBoxes);
+      } catch (e, st) {
+        debugPrint('[OCR][CNN] classifier refinement threw: $e\n$st');
+      }
+      final classifierBoxes = (cnnResult?['charBoxes'] as List?)
+          ?.map((c) => DetectionResult.fromJson(Map<String, dynamic>.from(c as Map)))
+          .toList();
+      // Same length as charBoxes (same crops, same order) -- if the
+      // classifier dropped/added any, the positions no longer line up
+      // reliably, so fall back to the detector's own labels entirely rather
+      // than risk splicing mismatched positions together.
+      final rawCharBoxes = (classifierBoxes != null && classifierBoxes.length == charBoxes.length)
+          ? classifierBoxes
+          : charBoxes;
+      final String crnnText = rawCharBoxes.map((c) => c.className).join();
+      // Thin green/red per character -- green when that position's
+      // predicted character matches the truth value at the same position,
+      // red when it doesn't. This is a positional compare against the
+      // *normalized* truth value (target may have spaces, e.g. "PART_NO
+      // SERIAL_NO"), so it only ever runs when there's a truth value to
+      // compare against; with no target every box just carries its
+      // predicted character with no match color (isOcrMatch stays null,
+      // same as "not checked" everywhere else in the app).
+      if (target.isNotEmpty) {
+        final normTarget = _normalizeOcr(target);
+        charBoxesForDisplay = [
+          for (var i = 0; i < rawCharBoxes.length; i++)
+            rawCharBoxes[i].copyWith(
+              isOcrMatch: i < normTarget.length && rawCharBoxes[i].className == normTarget[i],
+            ),
+        ];
+      } else {
+        charBoxesForDisplay = rawCharBoxes;
+      }
+      debugPrint('[OCR][CNN] region="${det.className}" chars=${charBoxes.length} '
+          'source=${classifierBoxes != null && classifierBoxes.length == charBoxes.length ? "classifier" : "detector labels"} read="$crnnText"');
+{% else %}
+      // Two-stage read, matching the standalone OCR pipeline
+      // (ocr_recognizer.dart's _recognizeWithCrnn) rather than feeding the
+      // recognizer the raw region box. The CRNN is trained on TIGHT SINGLE
+      // LINES of text, so handing it the whole plate box -- border,
+      // background and all the padding around the characters -- is not the
+      // input it was trained on, and it reads badly or not at all. When the
+      // detector also found single-character-class boxes inside this region,
+      // group them into reading rows and read each row's tight merged rect
+      // instead; that is the same crop the standalone screen reads, which is
+      // why that screen reads correctly and this one did not.
+      final lineCrops = _lineCropsInsideRegion(det, allDetections, source);
+      final List<String> lineReads = [];
+      if (lineCrops.isNotEmpty) {
+        for (final lineCrop in lineCrops) {
+          final t = await _readWithCrnn(_ocrInterpreter!, _ocrCharset, _ocrBlankIndex, lineCrop) ?? '';
+          if (t.isNotEmpty) lineReads.add(t);
+        }
+      }
+      // No character boxes inside the region (detector only trained on the
+      // region class, or it missed them this frame) -- fall back to reading
+      // the region crop whole, which is the old behavior.
+      final String crnnText = lineReads.isNotEmpty
+          ? lineReads.join(' ')
+          : (await _readWithCrnn(_ocrInterpreter!, _ocrCharset, _ocrBlankIndex, cropped) ?? '');
+      debugPrint('[OCR][CRNN] region="${det.className}" '
+          'source=${lineCrops.isNotEmpty ? "char_boxes(${lineCrops.length} line(s))" : "region_crop"} '
+          'read="$crnnText"');
+{% endif %}
+      if (target.isEmpty) {
+        // No target configured -- just record what was read, no pass/fail.
+        return det.copyWith(ocrText: crnnText, ocrCrnnText: crnnText, ocrCharBoxes: charBoxesForDisplay);
+      }
+      final normTarget = _normalizeOcr(target);
+      final normCrnn = _normalizeOcr(crnnText);
+      final crnnMatched = normTarget.length <= 8
+          ? normCrnn == normTarget || normCrnn.contains(normTarget)
+          : _ocrSimilarity(normCrnn, normTarget) >= 0.9;
+      debugPrint('[OCR][CRNN] read="$crnnText" target="$target" matched=$crnnMatched');
+      if (crnnMatched) {
+        return det.copyWith(ocrText: crnnText, isOcrMatch: true, ocrCrnnText: crnnText, ocrCharBoxes: charBoxesForDisplay);
+      }
+      // CRNN didn't match the target.
+      crnnReadForReport = crnnText;
+{% if not ocr_class_use_mlkit_fallback %}
+      // ML Kit fallback is off for this build -- the CRNN's own read is the
+      // final answer, matched or not. Skipping this avoids the expensive
+      // part of a mismatch: a 3x-upscale + per-tile-threshold + sharpen
+      // image pass (sometimes twice, normal + inverted) plus a synchronous
+      // native ML Kit round trip, on every box that doesn't match on the
+      // first try -- the dominant cost of a capture when it fires often.
+      return det.copyWith(ocrText: crnnText, isOcrMatch: false, ocrCrnnText: crnnText, ocrCharBoxes: charBoxesForDisplay);
+{% else %}
+      // Fall through to the ML Kit path below as a second opinion on this
+      // exact crop, same idea as the standalone OCR app's CRNN-then-ML-Kit
+      // fallback.
+{% endif %}
+    }
+    if (engine == 'crnn' && target.isEmpty) {
+      // CRNN model not loaded/ready and there's no target to fall back
+      // against with ML Kit -- nothing useful to return.
+      return det;
+    }
+{% endif %}
+
+    final tempDir = await Directory.systemTemp.createTemp('ocr_');
+    String extractedText = '';
+    try {
+      final normTarget = _normalizeOcr(target);
+      // Encoded once here and reused by both passes below; the heavy
+      // preprocessing itself happens on a background isolate.
+      final croppedPng = Uint8List.fromList(img.encodePng(cropped));
+      final normalBytes = await compute(
+          _preprocessForOcrIsolate, {'cropPng': croppedPng, 'invert': false});
+      final normalText = await _ocrBytes(normalBytes, tempDir, 'normal');
+      final normalScore = _ocrSimilarity(_normalizeOcr(normalText), normTarget);
+      debugPrint('[OCR] normal="$normalText"($normalScore) target="$target"');
+
+      // The inverted pass exists for stickers/lighting where the normal
+      // threshold comes out wrong -- it costs another full upscale +
+      // per-tile-threshold + sharpen pass plus a second ML Kit round-trip,
+      // so skip it once the normal read already scores a strong match
+      // instead of always running both unconditionally.
+      if (normalScore >= 0.9) {
+        extractedText = normalText;
+      } else {
+        final invertBytes = await compute(
+            _preprocessForOcrIsolate, {'cropPng': croppedPng, 'invert': true});
+        final invertText = await _ocrBytes(invertBytes, tempDir, 'invert');
+        final invertScore = _ocrSimilarity(_normalizeOcr(invertText), normTarget);
+        debugPrint('[OCR] invert="$invertText"($invertScore) target="$target"');
+        // Pick the read with higher similarity; fall back to normal if both empty
+        extractedText = normalScore >= invertScore ? normalText : invertText;
+        if (extractedText.isEmpty) extractedText = normalText.isNotEmpty ? normalText : invertText;
+      }
+    } finally {
+      await tempDir.delete(recursive: true);
+    }
+
+    final normExtracted = _normalizeOcr(extractedText);
+    final normTarget = _normalizeOcr(target);
+    // For short labels (≤8 chars): exact match only — one char wrong = wrong variant.
+    // For longer labels (>8 chars): allow 1 char tolerance via Levenshtein.
+    final bool matched = normTarget.length <= 8
+        ? normExtracted == normTarget || normExtracted.contains(normTarget)
+        : _ocrSimilarity(normExtracted, normTarget) >= 0.9;
+    debugPrint('[OCR] final="$extractedText" crnn="${crnnReadForReport ?? "(not run)"}" '
+        'normExtracted=$normExtracted normTarget=$normTarget matched=$matched');
+    // crnnReadForReport is only set when the CRNN already ran and didn't
+    // match the target (see the crnn branch above) -- ML Kit is a second
+    // opinion on the same crop, not a more trustworthy engine, so it must
+    // never silently replace what the trained recognizer actually read.
+    // Keep showing the CRNN's text (matching the standalone OCR screen's
+    // behavior) and only use ML Kit's result to flip the pass/fail flag if
+    // it happens to match where the CRNN didn't.
+    return det.copyWith(
+      ocrText: crnnReadForReport ?? extractedText,
+      isOcrMatch: matched,
+      ocrCrnnText: crnnReadForReport,
+      ocrMlKitText: extractedText,
+      ocrCharBoxes: charBoxesForDisplay,
+    );
+  }
+{% endif %}
+
+  /// TFLite CPU threads. 0 = automatic: min(4, cores) -- more threads than that rarely helps a
+  /// small YOLO on big.LITTLE phones (little cores slow the slowest thread, and the camera and UI
+  /// need cores too). Set from the live screen (remembered via CameraPrefs) to compare 2 / 4 / 6.
+  static int cpuThreads = 0;
+
+  static int effectiveThreads() {
+    final int cores = Platform.numberOfProcessors < 1 ? 1 : Platform.numberOfProcessors;
+    if (cpuThreads > 0) return cpuThreads > cores ? cores : cpuThreads;
+    return cores >= 4 ? 4 : cores;
+  }
+
+  /// CPU-only interpreter options (no GPU/NNAPI delegate).
+  static InterpreterOptions _cpuOptions() => InterpreterOptions()..threads = effectiveThreads();
+
+  /// Applies a new thread count: reloads the detector (and classifier) interpreters with it.
+  Future<void> setCpuThreads(int threads) async {
+    cpuThreads = threads;
+    final path = _currentModelPath;
+    final labels = _currentLabelsPath;
+    if (path == null || labels == null) return;
+{% if classifier_enabled %}
+    _clsInterpreter?.close();
+    _clsInterpreter = null;
+    _clsLoadTried = false;
+{% endif %}
+    _currentModelPath = null;
+    await loadModel(path, labels);
+  }
+
+  Future<void> loadModel(String modelPath, String labelsPath) async {
+    if (_currentModelPath == modelPath && _isLoaded) return;
+
+    _isLoaded = false;
+    _interpreter?.close();
+
+    // Always load labels first, independently of the interpreter delegate
+    try {
+      final labelsData = await rootBundle.loadString(labelsPath);
+      _labels = labelsData
+          .split('\n')
+          .map((l) => l.trim())
+          .where((l) => l.isNotEmpty)
+          .toList();
+    } catch (e) {
+      debugPrint('Error loading labels: $e');
+      _labels = [];
+    }
+
+    // Force CPU inference on all devices for consistent results.
+    // GpuDelegateV2 silently produces wrong output on many mid/low-range
+    // Android GPUs — all class predictions flip — so we avoid it entirely.
+    try {
+      _interpreter = await Interpreter.fromAsset(modelPath, options: _cpuOptions());
+    } catch (e) {
+      debugPrint('Error loading model: $e');
+      return;
+    }
+
+    _currentModelPath = modelPath;
+    _currentLabelsPath = labelsPath;
+    _isLoaded = true;
+    debugPrint('Model loaded: $modelPath with ${_labels.length} labels');
+  }
+
+{% if ocr_use_charonly_detector %}
+  Future<void> loadCharOnlyDetector(String modelPath, String labelsPath) async {
+    if (_charOnlyLoaded) return;
+    try {
+      final labelsData = await rootBundle.loadString(labelsPath);
+      _charOnlyLabels = labelsData
+          .split('\n')
+          .map((l) => l.trim())
+          .where((l) => l.isNotEmpty)
+          .toList();
+      _charOnlyInterpreter = await Interpreter.fromAsset(modelPath);
+      _charOnlyLoaded = true;
+      debugPrint('Class-agnostic char detector loaded: $modelPath (${_charOnlyLabels.length} labels)');
+    } catch (e) {
+      debugPrint('Error loading class-agnostic char detector: $e');
+    }
+  }
+{% endif %}
+
+  void dispose() {
+    _interpreter?.close();
+    _isLoaded = false;
+{% if classifier_enabled %}
+    _clsInterpreter?.close();
+    _clsInterpreter = null;
+    _clsLoadTried = false;
+{% endif %}
+{% if ocr_use_charonly_detector %}
+    _charOnlyInterpreter?.close();
+    _charOnlyLoaded = false;
+{% endif %}
+  }
+
+  /// Converts an already-decoded, EXIF-corrected [img.Image] into a flat
+  /// [Float32List] of shape [1, inputSize, inputSize, 3] ready for TFLite.
+  /// Using a typed flat buffer instead of nested [List.generate] calls is
+  /// ~5-10x faster because it avoids Dart object allocation overhead.
+  static Float32List _imageToFloat32(img.Image image, int inputSize, {bool fast = false}) {
+    final resized = img.copyResize(
+      image,
+      width: inputSize,
+      height: inputSize,
+      interpolation: img.Interpolation.linear,
+    );
+    final buffer = Float32List(inputSize * inputSize * 3);
+    // One pass over the raw RGB bytes instead of a getPixel() call (and Pixel object) per pixel.
+    // Live ticks only ([fast]); photo inspection keeps the original per-pixel path.
+    final Uint8List rgb = fast ? resized.getBytes(order: img.ChannelOrder.rgb) : Uint8List(0);
+    if (fast && rgb.length >= buffer.length) {
+      const double k = 1.0 / 255.0;
+      for (int i = 0; i < buffer.length; i++) {
+        buffer[i] = rgb[i] * k;
+      }
+      return buffer;
+    }
+    int idx = 0;
+    for (int y = 0; y < inputSize; y++) {
+      for (int x = 0; x < inputSize; x++) {
+        final pixel = resized.getPixel(x, y);
+        buffer[idx++] = pixel.r.toDouble() / 255.0;
+        buffer[idx++] = pixel.g.toDouble() / 255.0;
+        buffer[idx++] = pixel.b.toDouble() / 255.0;
+      }
+    }
+    return buffer;
+  }
+
+  /// Ultralytics-style letterbox: aspect-preserving resize, then pad to a
+  /// square canvas with Ultralytics' standard gray (114,114,114).
+  ///
+  /// _imageToFloat32 above stretches to inputSize x inputSize instead, which
+  /// distorts the frame. That is tolerable for large objects but collapses
+  /// detection of small, thin features -- engraved plate characters only a
+  /// few dozen pixels tall. The standalone OCR pipeline was fixed to
+  /// letterbox for precisely this reason; that fix was never carried over to
+  /// this shared detector, which is why the same photo yields character
+  /// boxes there and none here. The exported .tflite has no preprocessing
+  /// baked into the graph, so the caller has to reproduce it exactly.
+  static _LetterboxResult _letterboxToFloat32(img.Image image, int inputSize, {bool fast = false}) {
+    final ratio = (inputSize / image.width < inputSize / image.height)
+        ? inputSize / image.width
+        : inputSize / image.height;
+    final unpadW = (image.width * ratio).round().clamp(1, inputSize);
+    final unpadH = (image.height * ratio).round().clamp(1, inputSize);
+    final padX = ((inputSize - unpadW) / 2).floor();
+    final padY = ((inputSize - unpadH) / 2).floor();
+
+    final resized = img.copyResize(image,
+        width: unpadW, height: unpadH, interpolation: img.Interpolation.linear);
+    final canvas = img.Image(width: inputSize, height: inputSize);
+    img.fill(canvas, color: img.ColorRgb8(114, 114, 114));
+    img.compositeImage(canvas, resized, dstX: padX, dstY: padY);
+
+    final buffer = Float32List(inputSize * inputSize * 3);
+    if (fast) {
+      // Live ticks: one pass over the canvas' raw RGB bytes.
+      final Uint8List rgb = canvas.getBytes(order: img.ChannelOrder.rgb);
+      if (rgb.length >= buffer.length) {
+        const double k = 1.0 / 255.0;
+        for (int i = 0; i < buffer.length; i++) {
+          buffer[i] = rgb[i] * k;
+        }
+        return _LetterboxResult(buffer, padX, padY, unpadW, unpadH);
+      }
+    }
+    var idx = 0;
+    for (var y = 0; y < inputSize; y++) {
+      for (var x = 0; x < inputSize; x++) {
+        final p = canvas.getPixel(x, y);
+        buffer[idx++] = p.r.toDouble() / 255.0;
+        buffer[idx++] = p.g.toDouble() / 255.0;
+        buffer[idx++] = p.b.toDouble() / 255.0;
+      }
+    }
+    return _LetterboxResult(buffer, padX, padY, unpadW, unpadH);
+  }
+
+  /// Fast path: caller already decoded + EXIF-corrected the image (e.g.
+  /// during blur detection), so we skip the redundant decode +
+  /// bakeOrientation step. The resize-to-model-input-size + per-pixel
+  /// float32 conversion is real CPU work on top of that (e.g. 640x640 is
+  /// 400k+ pixel conversions) -- it used to run inline here on the UI
+  /// isolate before handing off to compute() for just the TFLite call,
+  /// which is what made every single detection during an inspection feel
+  /// laggy. It now happens inside the same background isolate as the
+  /// inference; since an img.Image can't cross the isolate boundary, pass
+  /// [orientedPngBytes] when the caller already has it (e.g. from the
+  /// blur check) to avoid a redundant re-encode -- otherwise it's encoded
+  /// here.
+  Future<List<DetectionResult>> predictImage(img.Image orientedImage, {Uint8List? orientedPngBytes}) async {
+    if (!_isLoaded || _interpreter == null) return [];
+
+    // JPEG q92 rather than lossless PNG: this is a full-resolution frame that
+    // only ever gets resized down to the model's input size, so PNG's much
+    // slower encode (and much larger byte array to copy into the isolate)
+    // buys nothing. Callers normally pass orientedPngBytes so this fallback
+    // rarely runs at all.
+    final pngBytes = orientedPngBytes ?? Uint8List.fromList(img.encodeJpg(orientedImage, quality: 92));
+    final detections = await compute(_runInferencePng, {
+      'pngBytes': pngBytes,
+      'interpreter_address': _interpreter!.address,
+      'labels': _labels,
+      'inputSize': {{ input_size }},
+      'threshold': confidenceThreshold,
+    });
+{% if ocr_enabled %}
+{% if ocr_use_charonly_detector %}
+    // Second, independent detector pass -- its "char"/"plate" boxes have no
+    // identity of their own (see the field doc on _charOnlyInterpreter), but
+    // tend to localize touching/engraved characters tighter than the main
+    // per-class detector. Only run when it actually loaded.
+    final charOnlyDetections = (_charOnlyLoaded && _charOnlyInterpreter != null)
+        ? await compute(_runInferencePng, {
+            'pngBytes': pngBytes,
+            'interpreter_address': _charOnlyInterpreter!.address,
+            'labels': _charOnlyLabels,
+            'inputSize': {{ ocr_charonly_input_size | default(640) }},
+            'threshold': confidenceThreshold,
+          })
+        : <DetectionResult>[];
+{% endif %}
+    final List<DetectionResult> withOcr = [];
+    for (final det in detections) {
+      // Pass every detection, not just this one -- the CRNN path needs the
+      // character boxes found inside this region to build its line crops.
+      withOcr.add(await _runOcrOnBbox(det, orientedImage, allDetections: detections{% if ocr_use_charonly_detector %}, charOnlyDetections: charOnlyDetections{% endif %}));
+    }
+    return {% if classifier_enabled %}await _applyClassifier(withOcr, orientedImage){% else %}withOcr{% endif %};
+{% else %}
+    return {% if classifier_enabled %}await _applyClassifier(detections, orientedImage){% else %}detections{% endif %};
+{% endif %}
+  }
+
+  /// Fallback path: accepts raw JPEG bytes when a pre-decoded image is not
+  /// available. Decodes + EXIF-corrects internally before inference.
+  Future<List<DetectionResult>> predictBytes(Uint8List bytes) async {
+    if (!_isLoaded || _interpreter == null) return [];
+
+    final detections = await compute(_runInferenceBytes, {
+      'bytes': bytes,
+      'interpreter_address': _interpreter!.address,
+      'labels': _labels,
+      'inputSize': {{ input_size }},
+      'threshold': confidenceThreshold,
+    });
+{% if ocr_enabled %}
+    img.Image? decoded = img.decodeImage(bytes);
+    if (decoded == null) return detections;
+    decoded = img.bakeOrientation(decoded);
+{% if ocr_use_charonly_detector %}
+    final decodedPngBytes = Uint8List.fromList(img.encodeJpg(decoded, quality: 92));
+    final charOnlyDetections = (_charOnlyLoaded && _charOnlyInterpreter != null)
+        ? await compute(_runInferencePng, {
+            'pngBytes': decodedPngBytes,
+            'interpreter_address': _charOnlyInterpreter!.address,
+            'labels': _charOnlyLabels,
+            'inputSize': {{ ocr_charonly_input_size | default(640) }},
+            'threshold': confidenceThreshold,
+          })
+        : <DetectionResult>[];
+{% endif %}
+    final List<DetectionResult> withOcr = [];
+    for (final det in detections) {
+      withOcr.add(await _runOcrOnBbox(det, decoded, allDetections: detections{% if ocr_use_charonly_detector %}, charOnlyDetections: charOnlyDetections{% endif %}));
+    }
+    return {% if classifier_enabled %}await _applyClassifier(withOcr, decoded){% else %}withOcr{% endif %};
+{% else %}
+{% if classifier_enabled %}
+    img.Image? decodedForClassifier = img.decodeImage(bytes);
+    if (decodedForClassifier == null) return detections;
+    decodedForClassifier = img.bakeOrientation(decodedForClassifier);
+    return await _applyClassifier(detections, decodedForClassifier);
+{% else %}
+    return detections;
+{% endif %}
+{% endif %}
+  }
+
+  /// Inference isolate entry-point for the fast path: decodes the
+  /// (lossless, orientation-already-baked) PNG and does the resize +
+  /// float32 conversion here, on the background isolate, instead of the
+  /// caller doing it on the UI isolate before compute() is even reached.
+  static List<DetectionResult> _runInferencePng(Map<String, dynamic> args) {
+    // decodeImage, not decodePng -- these bytes are JPEG now (see the encode
+    // side); format-agnostic decoding stays correct either way.
+    final decoded = img.decodeImage(args['pngBytes'] as Uint8List);
+    if (decoded == null) return [];
+    return _inferOnDecoded(decoded, args);
+  }
+
+  /// Live-tick fast path: raw camera planes in, detections out, all inside
+  /// ONE background isolate. The old tick path converted YUV -> RGB, encoded
+  /// a JPEG, copied it to a second isolate, decoded it again, and only then
+  /// resized + ran the model. The JPEG round trip cost time on every tick
+  /// and was lossy; here the RGB image goes straight to the same resize +
+  /// float32 preprocessing the other entry points use. No OCR on ticks.
+  ///
+  /// [frame] = {width, height, planes: [{bytes, bytesPerRow, bytesPerPixel}],
+  /// rotationDegrees, targetWidth} (see [yuvFrameToImage]).
+  /// One-shot: the next [predictFrame] saves the exact model input (and the frame it came from)
+  /// to Pictures/MAI/<app>/DebugInput so it can be run through the Python model for comparison.
+  bool saveNextInput = false;
+  String? _savedInputPath;
+  static String? _lastSavedInputPath;
+
+  /// Path of the files saved by the last tick that was asked to save, once (then null).
+  String? takeSavedInputPath() {
+    final p = _savedInputPath;
+    _savedInputPath = null;
+    return p;
+  }
+
+  /// Writes the frame as seen by the detector and the model input (letterboxed or stretched,
+  /// exactly what the network receives) as JPEGs. Returns the folder, or null on failure.
+  static String? _saveDebugInput(img.Image frame, Float32List input, int inputSize) {
+    try {
+      final appName = '{{ app_name }}'.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
+      final dir = Directory('/storage/emulated/0/Pictures/MAI/$appName/DebugInput');
+      dir.createSync(recursive: true);
+      final now = DateTime.now();
+      String two(int v) => v.toString().padLeft(2, '0');
+      final stamp = '${now.year}${two(now.month)}${two(now.day)}_${two(now.hour)}${two(now.minute)}${two(now.second)}';
+      final bytes = Uint8List(inputSize * inputSize * 3);
+      for (int i = 0; i < bytes.length; i++) {
+        bytes[i] = (input[i] * 255.0).round().clamp(0, 255);
+      }
+      final modelInput = img.Image.fromBytes(
+          width: inputSize, height: inputSize, bytes: bytes.buffer, numChannels: 3);
+      File('${dir.path}/${stamp}_model_input_${inputSize}.jpg')
+          .writeAsBytesSync(img.encodeJpg(modelInput, quality: 95), flush: true);
+      File('${dir.path}/${stamp}_frame_${frame.width}x${frame.height}.jpg')
+          .writeAsBytesSync(img.encodeJpg(frame, quality: 95), flush: true);
+      return dir.path;
+    } catch (e) {
+      debugPrint('[Detector] could not save debug input: $e');
+      return null;
+    }
+  }
+
+  Future<List<DetectionResult>> predictFrame(Map<String, dynamic> frame) async {
+    if (!_isLoaded || _interpreter == null) return [];
+{% if classifier_enabled %}
+    // Loaded here (UI isolate) so the tick isolate only needs its address.
+    final clsInterp = await _ensureClassifier();
+{% endif %}
+    final Map<String, dynamic> res = await compute(_runInferenceFrame, {
+      ...frame,
+      'interpreter_address': _interpreter!.address,
+      'labels': _labels,
+      'inputSize': {{ input_size }},
+      'threshold': confidenceThreshold,
+      'saveInput': saveNextInput,
+{% if classifier_enabled %}
+      'cls_interpreter_address': clsInterp?.address,
+{% endif %}
+    });
+    if (saveNextInput) {
+      saveNextInput = false;
+      _savedInputPath = res['savedPath'] as String?;
+    }
+    lastTickTimings = Map<String, int>.from(res['timings'] as Map);
+    return List<DetectionResult>.from(res['dets'] as List);
+  }
+
+  /// Per-stage milliseconds of the most recent [predictFrame] call (decode / detect / classify,
+  /// plus the frame size) -- shown in the live debug log.
+  Map<String, int> lastTickTimings = const {};
+
+  static Map<String, dynamic> _runInferenceFrame(Map<String, dynamic> args) {
+    final sw = Stopwatch()..start();
+    final image = yuvFrameToImage(args);
+    final int decodeMs = sw.elapsedMilliseconds;
+    if (image == null) return {'dets': <DetectionResult>[], 'timings': {'decode': decodeMs}};
+    sw.reset();
+    final Map<String, int> stage = {};
+    var detections = _inferOnDecoded(image, args, stage);
+    final int detectMs = sw.elapsedMilliseconds;
+    int classifyMs = 0;
+{% if classifier_enabled %}
+    // Region classifier on the tick's own decoded frame (e.g. Max_reg -> locked / unlocked).
+    final int? clsAddress = args['cls_interpreter_address'] as int?;
+    if (clsAddress != null && detections.isNotEmpty) {
+      sw.reset();
+      detections = _applyClassifierSync(detections, image, clsAddress);
+      classifyMs = sw.elapsedMilliseconds;
+    }
+{% endif %}
+    return {
+      'dets': detections,
+      'savedPath': stage.containsKey('saved') ? _lastSavedInputPath : null,
+      'timings': {'decode': decodeMs, 'detect': detectMs, 'classify': classifyMs, 'w': image.width, 'h': image.height, ...stage},
+    };
+  }
+
+  /// Converts one raw camera stream frame (YUV420 -- 3 planes on Android, or
+  /// a 2-plane NV12-style frame on iOS) to an upright RGB [img.Image],
+  /// downscaled to ~[targetWidth] wide while sampling (never upscaled) so a
+  /// tick doesn't pay for full sensor resolution. [rotationDegrees] is the
+  /// camera's sensorOrientation. Returns null on a malformed frame.
+  static img.Image? yuvFrameToImage(Map<String, dynamic> args) {
+    try {
+      final int width = args['width'] as int;
+      final int height = args['height'] as int;
+      final List<dynamic> planes = args['planes'] as List<dynamic>;
+      final int rotationDegrees = args['rotationDegrees'] as int;
+      final int targetWidth = args['targetWidth'] as int;
+
+      final Map yPlane = planes[0] as Map;
+      final Uint8List yBytes = yPlane['bytes'] as Uint8List;
+      final int yRowStride = yPlane['bytesPerRow'] as int;
+
+      final Uint8List uBytes;
+      final Uint8List vBytes;
+      final int uvRowStride;
+      final int uvPixelStride;
+      final bool threePlane = planes.length >= 3;
+      if (threePlane) {
+        final Map uPlane = planes[1] as Map;
+        final Map vPlane = planes[2] as Map;
+        uBytes = uPlane['bytes'] as Uint8List;
+        vBytes = vPlane['bytes'] as Uint8List;
+        uvRowStride = uPlane['bytesPerRow'] as int;
+        uvPixelStride = (uPlane['bytesPerPixel'] as int?) ?? 1;
+      } else {
+        final Map uvPlane = planes[1] as Map;
+        final Uint8List uv = uvPlane['bytes'] as Uint8List;
+        uBytes = uv;
+        vBytes = uv;
+        uvRowStride = uvPlane['bytesPerRow'] as int;
+        uvPixelStride = 2;
+      }
+
+      final double scale = width > targetWidth ? targetWidth / width : 1.0;
+      final int outW = (width * scale).round().clamp(1, width);
+      final int outH = (height * scale).round().clamp(1, height);
+
+      final out = img.Image(width: outW, height: outH);
+      for (int oy = 0; oy < outH; oy++) {
+        final int y = (oy / scale).floor().clamp(0, height - 1);
+        final int yRow = y * yRowStride;
+        final int uvRow = (y >> 1) * uvRowStride;
+        for (int ox = 0; ox < outW; ox++) {
+          final int x = (ox / scale).floor().clamp(0, width - 1);
+          final int yIndex = yRow + x;
+          if (yIndex >= yBytes.length) continue;
+          final int uvIndex = uvRow + (x >> 1) * uvPixelStride;
+
+          final int yVal = yBytes[yIndex];
+          int uVal, vVal;
+          if (threePlane) {
+            if (uvIndex >= uBytes.length || uvIndex >= vBytes.length) continue;
+            uVal = uBytes[uvIndex];
+            vVal = vBytes[uvIndex];
+          } else {
+            // NV12: U then V interleaved in the same buffer.
+            if (uvIndex + 1 >= uBytes.length) continue;
+            uVal = uBytes[uvIndex];
+            vVal = uBytes[uvIndex + 1];
+          }
+
+          final double yy = yVal.toDouble();
+          final double uu = uVal.toDouble() - 128.0;
+          final double vv = vVal.toDouble() - 128.0;
+          out.setPixelRgb(
+            ox,
+            oy,
+            (yy + 1.402 * vv).round().clamp(0, 255),
+            (yy - 0.344136 * uu - 0.714136 * vv).round().clamp(0, 255),
+            (yy + 1.772 * uu).round().clamp(0, 255),
+          );
+        }
+      }
+
+      if (rotationDegrees == 90 || rotationDegrees == 180 || rotationDegrees == 270) {
+        return img.copyRotate(out, angle: rotationDegrees);
+      }
+      return out;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Shared inference body: resize/letterbox + float32 + model + parse, for
+  /// an already-decoded RGB image. Runs inside a background isolate.
+  static List<DetectionResult> _inferOnDecoded(img.Image decoded, Map<String, dynamic> args, [Map<String, int>? t]) {
+    final sw = Stopwatch()..start();
+    final int interpreterAddress = args['interpreter_address'] as int;
+    final List<String> labels = List<String>.from(args['labels'] as List);
+    final int inputSize = args['inputSize'] as int;
+    final double threshold = args['threshold'] as double;
+
+    final interpreter = Interpreter.fromAddress(interpreterAddress);
+    // Live ticks (t != null) letterbox like Ultralytics training does: keep the aspect ratio and pad with
+    // grey (114). Stretching a portrait 360x640 frame to a square distorted every object. Photo
+    // inspection keeps its original stretch unless the app has OCR (always letterboxed).
+    final bool useLetterbox = {% if ocr_enabled %}true{% else %}t != null{% endif %};
+    _LetterboxResult? lb;
+    final Float32List input;
+    if (useLetterbox) {
+      lb = _letterboxToFloat32(decoded, inputSize, fast: t != null);
+      input = lb.buffer;
+    } else {
+      input = _imageToFloat32(decoded, inputSize, fast: t != null);
+    }
+    if (t != null && args['saveInput'] == true) {
+      final path = _saveDebugInput(decoded, input, inputSize);
+      if (path != null) t['saved'] = 1;
+      _lastSavedInputPath = path;
+    }
+
+    t?['prep'] = sw.elapsedMilliseconds;
+    sw.reset();
+    final raw = _runModel(interpreter, input, fast: t != null);
+    t?['run'] = sw.elapsedMilliseconds;
+    if (raw == null) return [];
+    sw.reset();
+    final detections = _parseGenericYolo(raw.output[0], labels, threshold, inputSize, raw.shape,
+        protos: raw.protos, protoShape: raw.protoShape,
+        padX: lb?.padX ?? 0, padY: lb?.padY ?? 0, unpadW: lb?.unpadW ?? 0, unpadH: lb?.unpadH ?? 0);
+    t?['post'] = sw.elapsedMilliseconds;
+    debugPrint('[Detector] raw detections: ${detections.length}, first bbox: ${detections.isNotEmpty ? detections.first.bbox : "none"}');
+    return detections;
+  }
+
+  /// Inference isolate entry-point for the fallback path (raw JPEG bytes).
+  static List<DetectionResult> _runInferenceBytes(Map<String, dynamic> args) {
+    final Uint8List bytes = args['bytes'] as Uint8List;
+    final int interpreterAddress = args['interpreter_address'] as int;
+    final List<String> labels = List<String>.from(args['labels'] as List);
+    final int inputSize = args['inputSize'] as int;
+    final double threshold = args['threshold'] as double;
+
+    final interpreter = Interpreter.fromAddress(interpreterAddress);
+
+    img.Image? baseImage = img.decodeImage(bytes);
+    if (baseImage == null) return [];
+
+    // Apply EXIF orientation before inference. Android's takePicture() often
+    // returns a landscape JPEG with an EXIF rotation tag. Flutter's Image
+    // widget handles this automatically, but img.decodeImage does not - so
+    // without this fix the model runs on a landscape frame while the display
+    // shows a portrait one, causing x/y axes to be effectively swapped.
+    baseImage = img.bakeOrientation(baseImage);
+
+{% if ocr_enabled %}
+    final lb = _letterboxToFloat32(baseImage, inputSize);
+    final Float32List input = lb.buffer;
+{% else %}
+    // Use Float32List for fast normalization (avoids nested Dart object alloc).
+    final inputData = _imageToFloat32(baseImage, inputSize);
+    final Float32List input = inputData;
+{% endif %}
+
+    final raw = _runModel(interpreter, input);
+    if (raw == null) return [];
+    final detections = _parseGenericYolo(raw.output[0], labels, threshold, inputSize, raw.shape,
+        protos: raw.protos, protoShape: raw.protoShape{% if ocr_enabled %},
+        padX: lb.padX, padY: lb.padY, unpadW: lb.unpadW, unpadH: lb.unpadH{% endif %});
+    debugPrint('[Detector] raw detections: ${detections.length}, first bbox: ${detections.isNotEmpty ? detections.first.bbox : "none"}');
+    return detections;
+  }
+
+  /// Detect-only fast path. Feeds the input as raw float bytes and reads the output tensor's raw
+  /// bytes as one flat Float32List, exposed as per-row zero-copy views so the parsers' output[i][j]
+  /// indexing is unchanged. The nested-list copy of [1, 4+N, 8400] was a large share of a tick.
+  /// Returns null (caller uses the old nested-list path) for anything unexpected.
+  static _RawOutput? _runFlat(Interpreter interpreter, Float32List flatIn, int detIdx, List<int> shape) {
+    try {
+      final inTensor = interpreter.getInputTensor(0);
+      int inElems = 1;
+      for (final d in inTensor.shape) {
+        inElems *= d;
+      }
+      if (flatIn.length != inElems) return null;
+      inTensor.data = flatIn.buffer.asUint8List(flatIn.offsetInBytes, flatIn.lengthInBytes);
+      interpreter.invoke();
+      final Uint8List outBytes = interpreter.getOutputTensor(detIdx).data;
+      final int rows = shape[1];
+      final int cols = shape[2];
+      if (shape[0] != 1 || outBytes.length != rows * cols * 4) return null;
+      final Float32List flat = outBytes.offsetInBytes % 4 == 0
+          ? outBytes.buffer.asFloat32List(outBytes.offsetInBytes, rows * cols)
+          : Uint8List.fromList(outBytes).buffer.asFloat32List();
+      final List<Float32List> rowViews =
+          List.generate(rows, (r) => Float32List.sublistView(flat, r * cols, (r + 1) * cols), growable: false);
+      return _RawOutput(<dynamic>[rowViews], shape, null, null);
+    } catch (e) {
+      debugPrint('[Detector] flat output path unavailable, using nested lists: $e');
+      return null;
+    }
+  }
+
+  /// Runs the model. A detect export has one output ([1, 4+N, boxes]); a
+  /// segment export has a second rank-4 output (the mask prototypes,
+  /// [1, mh, mw, nm] or [1, nm, mh, mw]) that is what turns a box into a
+  /// polygon. Returns null for an unusable output layout.
+  static _RawOutput? _runModel(Interpreter interpreter, Float32List input, {bool fast = false}) {
+    final outTensors = interpreter.getOutputTensors();
+    int detIdx = -1;
+    int protoIdx = -1;
+    for (int i = 0; i < outTensors.length; i++) {
+      final len = outTensors[i].shape.length;
+      if (len == 3 && detIdx < 0) detIdx = i;
+      if (len == 4 && protoIdx < 0) protoIdx = i;
+    }
+    if (detIdx < 0) return null;
+    final shape = outTensors[detIdx].shape;
+    if (fast && protoIdx < 0) {
+      // Fast path (live ticks only): raw float bytes straight from the output tensor (no nested-list copy).
+      final fast = _runFlat(interpreter, input, detIdx, shape);
+      if (fast != null) return fast;
+    }
+    final output = List.generate(shape[0], (_) => List.generate(shape[1], (_) => List.filled(shape[2], 0.0)));
+    final Object shapedInput = input.reshape(interpreter.getInputTensor(0).shape);
+    if (protoIdx < 0) {
+      interpreter.run(shapedInput, output);
+      return _RawOutput(output, shape, null, null);
+    }
+    final ps = outTensors[protoIdx].shape;
+    final protos = List.generate(ps[0], (_) => List.generate(ps[1], (_) => List.generate(ps[2], (_) => List.filled(ps[3], 0.0))));
+    interpreter.runForMultipleInputs([shapedInput], {detIdx: output, protoIdx: protos});
+    return _RawOutput(output, shape, protos, ps);
+  }
+
+  /// [padX]/[padY]/[unpadW]/[unpadH] describe the letterbox applied to the
+  /// input. When unpadW/unpadH are 0 (no letterbox) the original stretch
+  /// mapping is used unchanged, so non-OCR apps produce byte-identical boxes.
+  static List<DetectionResult> _parseGenericYolo(
+    List<dynamic> output,
+    List<String> labels,
+    double threshold,
+    int inputSize,
+    List<int> shape, {
+    int padX = 0,
+    int padY = 0,
+    int unpadW = 0,
+    int unpadH = 0,
+    List<dynamic>? protos,
+    List<int>? protoShape,
+  }) {
+    final results = <DetectionResult>[];
+    // Per-detection mask coefficients + canvas-space box, only kept for a
+    // segment model; keyed by identity so they survive NMS reordering.
+    final segInfo = Map<DetectionResult, _SegInfo>.identity();
+
+    // End-to-end exports (YOLO26 and other NMS-free models) return
+    // [1, maxDet, 6] = x1, y1, x2, y2, score, classIndex per row, with the
+    // duplicate removal already done inside the model. The grid decoder below
+    // would read the score / class index as class scores and the corners as
+    // centre + size, giving hundreds of bogus boxes, so decode that layout
+    // separately. A classic 2-class export is also 6 wide, so with
+    // exactly two labels the rows are checked for the end-to-end signature.
+    if (shape.length == 3 && shape[2] == 6 && shape[1] > 6 &&
+        (labels.length != 2 || _looksEndToEnd(output))) {
+      return _parseEndToEnd(output, labels, threshold, inputSize, padX, padY, unpadW, unpadH);
+    }
+
+    // Check if output is [4+N, 8400] or [8400, 4+N]
+    bool isTransposed = shape[1] < shape[2];
+    int numElements = isTransposed ? shape[1] : shape[2];
+    int numBoxes = isTransposed ? shape[2] : shape[1];
+    final int numMaskCoeffs = numElements - 4 - labels.length;
+    final bool hasMasks = protos != null && protoShape != null && numMaskCoeffs > 0;
+
+    // Auto-detect whether coordinates are absolute pixels [0, inputSize]
+    // or already normalized [0, 1]. Sample the first few valid cx values:
+    // any absolute-pixel coord from a real detection will be > 1.5, whereas
+    // normalized coords are always <= 1.0.
+    double maxSampledCoord = 0.0;
+    final sampleCount = numBoxes < 200 ? numBoxes : 200;
+    for (int i = 0; i < sampleCount; i++) {
+      final cx = (isTransposed ? output[0][i] : output[i][0]) as double;
+      final cy = (isTransposed ? output[1][i] : output[i][1]) as double;
+      if (cx > maxSampledCoord) maxSampledCoord = cx;
+      if (cy > maxSampledCoord) maxSampledCoord = cy;
+    }
+    // If max sampled coord is <= 1.5 the model outputs normalized [0,1] coords;
+    // skip the /inputSize division so bboxes are placed correctly.
+    final double coordScale = maxSampledCoord > 1.5 ? inputSize.toDouble() : 1.0;
+
+    for (int i = 0; i < numBoxes; i++) {
+      double maxClassScore = -1.0;
+      int classId = -1;
+
+      // Class scores start at index 4. A detect-task export has exactly
+      // numElements == 4 + labels.length, so this bound is a no-op there.
+      // A segment-task export has numElements == 4 + labels.length + 32
+      // (trailing mask coefficients, not class scores) -- capping the loop
+      // at labels.length keeps those 32 extra channels from being read as
+      // bogus classes, so a seg-trained detector produces correct boxes
+      // instead of garbage confidences / out-of-range class ids.
+      final int numClasses = 4 + labels.length < numElements ? 4 + labels.length : numElements;
+      for (int j = 4; j < numClasses; j++) {
+        double score = isTransposed ? output[j][i] : output[i][j];
+        if (score > maxClassScore) {
+          maxClassScore = score;
+          classId = j - 4;
+        }
+      }
+
+      if (maxClassScore >= threshold) {
+        double cx = isTransposed ? output[0][i] : output[i][0];
+        double cy = isTransposed ? output[1][i] : output[i][1];
+        double w = isTransposed ? output[2][i] : output[i][2];
+        double h = isTransposed ? output[3][i] : output[i][3];
+
+        // Undo the letterbox when one was applied: convert to canvas pixel
+        // space, subtract the pad offset, then divide by the *unpadded*
+        // extent -- not the full canvas -- to land back in normalized
+        // original-image coordinates. Without this the boxes would be
+        // shifted and scaled by the padding.
+        final bool letterboxed = unpadW > 0 && unpadH > 0;
+        final Rect box;
+        if (letterboxed) {
+          final double toCanvas = maxSampledCoord > 1.5 ? 1.0 : inputSize.toDouble();
+          final double ccx = cx * toCanvas;
+          final double ccy = cy * toCanvas;
+          final double cw = w * toCanvas;
+          final double ch = h * toCanvas;
+          box = Rect.fromLTWH(
+            (ccx - cw / 2 - padX) / unpadW,
+            (ccy - ch / 2 - padY) / unpadH,
+            cw / unpadW,
+            ch / unpadH,
+          );
+        } else {
+          box = Rect.fromLTWH(
+            (cx - w / 2) / coordScale,
+            (cy - h / 2) / coordScale,
+            w / coordScale,
+            h / coordScale,
+          );
+        }
+        final det = DetectionResult(
+          className: (classId >= 0 && classId < labels.length) ? labels[classId] : 'unknown (id:$classId)',
+          confidence: maxClassScore,
+          bbox: box,
+        );
+        results.add(det);
+        if (hasMasks) {
+          // Box in canvas-normalized [0,1] coords (the space the mask
+          // prototypes live in), plus this box's mask coefficients.
+          final double denom = maxSampledCoord > 1.5 ? inputSize.toDouble() : 1.0;
+          final coeffs = List<double>.generate(numMaskCoeffs, (k) {
+            final ch = 4 + labels.length + k;
+            return (isTransposed ? output[ch][i] : output[i][ch]) as double;
+          });
+          segInfo[det] = _SegInfo(
+            coeffs,
+            Rect.fromLTRB((cx - w / 2) / denom, (cy - h / 2) / denom, (cx + w / 2) / denom, (cy + h / 2) / denom),
+          );
+        }
+      }
+    }
+    final kept = _applyNMS(results, iouThreshold: 0.45);
+    if (!hasMasks) return kept;
+
+    final bool letterboxed = unpadW > 0 && unpadH > 0;
+    // Canvas-normalized point -> normalized original-image point, the same
+    // transform the bbox above went through.
+    Offset toImage(double u, double v) => letterboxed
+        ? Offset((u * inputSize - padX) / unpadW, (v * inputSize - padY) / unpadH)
+        : Offset(u, v);
+    return kept.map((d) {
+      final info = segInfo[d];
+      if (info == null) return d;
+      final poly = _maskToPolygon(info.coeffs, info.canvasBox, protos!, protoShape!, toImage);
+      return poly == null ? d : d.copyWith(polygon: poly);
+    }).toList();
+  }
+
+  /// mask = sigmoid(coeffs . protos), cropped to the detection box, then the
+  /// outline of its largest blob simplified to a small polygon (normalized
+  /// original-image coords). Null when the mask is empty.
+  static List<Offset>? _maskToPolygon(
+    List<double> coeffs,
+    Rect canvasBox,
+    List<dynamic> protos,
+    List<int> ps,
+    Offset Function(double, double) toImage,
+  ) {
+    final bool nhwc = ps[3] == coeffs.length;
+    final int mh = nhwc ? ps[1] : ps[2];
+    final int mw = nhwc ? ps[2] : ps[3];
+    final int nm = coeffs.length;
+    final p = protos[0] as List;
+
+    final int x0 = (canvasBox.left * mw).floor().clamp(0, mw - 1).toInt();
+    final int x1 = (canvasBox.right * mw).ceil().clamp(x0 + 1, mw).toInt();
+    final int y0 = (canvasBox.top * mh).floor().clamp(0, mh - 1).toInt();
+    final int y1 = (canvasBox.bottom * mh).ceil().clamp(y0 + 1, mh).toInt();
+    final int gw = x1 - x0;
+    final int gh = y1 - y0;
+
+    // Binary mask on the cropped grid (logit > 0 == sigmoid > 0.5).
+    final grid = List<bool>.filled(gw * gh, false);
+    bool any = false;
+    for (int y = 0; y < gh; y++) {
+      for (int x = 0; x < gw; x++) {
+        double logit = 0.0;
+        if (nhwc) {
+          final cell = p[y0 + y][x0 + x] as List;
+          for (int k = 0; k < nm; k++) {
+            logit += coeffs[k] * (cell[k] as double);
+          }
+        } else {
+          for (int k = 0; k < nm; k++) {
+            logit += coeffs[k] * ((p[k] as List)[y0 + y][x0 + x] as double);
+          }
+        }
+        if (logit > 0) {
+          grid[y * gw + x] = true;
+          any = true;
+        }
+      }
+    }
+    if (!any) return null;
+
+    // Keep only the largest 4-connected blob (drops stray specks).
+    final comp = List<int>.filled(gw * gh, 0);
+    int bestLabel = 0, bestSize = 0, label = 0;
+    for (int s = 0; s < gw * gh; s++) {
+      if (!grid[s] || comp[s] != 0) continue;
+      label++;
+      int size = 0;
+      final stack = <int>[s];
+      comp[s] = label;
+      while (stack.isNotEmpty) {
+        final c = stack.removeLast();
+        size++;
+        final fx = c % gw, fy = c ~/ gw;
+        if (fx > 0 && grid[c - 1] && comp[c - 1] == 0) { comp[c - 1] = label; stack.add(c - 1); }
+        if (fx < gw - 1 && grid[c + 1] && comp[c + 1] == 0) { comp[c + 1] = label; stack.add(c + 1); }
+        if (fy > 0 && grid[c - gw] && comp[c - gw] == 0) { comp[c - gw] = label; stack.add(c - gw); }
+        if (fy < gh - 1 && grid[c + gw] && comp[c + gw] == 0) { comp[c + gw] = label; stack.add(c + gw); }
+      }
+      if (size > bestSize) { bestSize = size; bestLabel = label; }
+    }
+    bool inMask(int x, int y) => x >= 0 && y >= 0 && x < gw && y < gh && comp[y * gw + x] == bestLabel;
+
+    // Moore-neighbour boundary trace of that blob.
+    int sx = -1, sy = -1;
+    outer:
+    for (int y = 0; y < gh; y++) {
+      for (int x = 0; x < gw; x++) {
+        if (inMask(x, y)) { sx = x; sy = y; break outer; }
+      }
+    }
+    if (sx < 0) return null;
+    const dx = [-1, -1, 0, 1, 1, 1, 0, -1];
+    const dy = [0, -1, -1, -1, 0, 1, 1, 1];
+    final contour = <Offset>[Offset(sx.toDouble(), sy.toDouble())];
+    int cx = sx, cy = sy, dir = 4; // first pixel in scan order: entered heading east
+    for (int guard = 0; guard < gw * gh * 4; guard++) {
+      bool moved = false;
+      for (int i = 0; i < 8; i++) {
+        final d = (dir + 5 + i) % 8; // clockwise, starting just past the backtrack cell
+        final nx = cx + dx[d], ny = cy + dy[d];
+        if (inMask(nx, ny)) {
+          cx = nx; cy = ny; dir = d; moved = true;
+          break;
+        }
+      }
+      if (!moved || (cx == sx && cy == sy)) break;
+      contour.add(Offset(cx.toDouble(), cy.toDouble()));
+    }
+    if (contour.length < 3) return null;
+
+    final simplified = _simplifyPolygon(contour, 1.0);
+    if (simplified.length < 3) return null;
+    return simplified
+        .map((o) => toImage((x0 + o.dx + 0.5) / mw, (y0 + o.dy + 0.5) / mh))
+        .toList();
+  }
+
+  /// Douglas-Peucker on a closed ring (split at the two farthest-apart
+  /// points so the ring's seam isn't an arbitrary anchor).
+  static List<Offset> _simplifyPolygon(List<Offset> pts, double eps) {
+    if (pts.length < 4) return pts;
+    int far = 0;
+    double best = -1;
+    for (int i = 1; i < pts.length; i++) {
+      final d = (pts[i] - pts[0]).distanceSquared;
+      if (d > best) { best = d; far = i; }
+    }
+    final a = _dp(pts.sublist(0, far + 1), eps);
+    final b = _dp([...pts.sublist(far), pts[0]], eps);
+    return [...a.sublist(0, a.length - 1), ...b.sublist(0, b.length - 1)];
+  }
+
+  static List<Offset> _dp(List<Offset> pts, double eps) {
+    if (pts.length < 3) return pts;
+    final a = pts.first, b = pts.last;
+    double maxD = 0;
+    int idx = 0;
+    final ab = b - a;
+    final len2 = ab.distanceSquared;
+    for (int i = 1; i < pts.length - 1; i++) {
+      final ap = pts[i] - a;
+      final double d = len2 == 0
+          ? ap.distance
+          : ((ap.dx * ab.dy - ap.dy * ab.dx).abs() / ab.distance);
+      if (d > maxD) { maxD = d; idx = i; }
+    }
+    if (maxD <= eps) return [a, b];
+    final l = _dp(pts.sublist(0, idx + 1), eps);
+    final r = _dp(pts.sublist(idx), eps);
+    return [...l.sublist(0, l.length - 1), ...r];
+  }
+
+  /// True when a [rows][6] output looks end-to-end: the class column holds whole
+  /// numbers and the score column is sorted high to low (top-k order).
+  static bool _looksEndToEnd(List<dynamic> output) {
+    final int n = output.length < 20 ? output.length : 20;
+    double prev = double.infinity;
+    for (int i = 0; i < n; i++) {
+      final double score = output[i][4] as double;
+      final double cls = output[i][5] as double;
+      if (cls != cls.roundToDouble() || score > prev) return false;
+      prev = score;
+    }
+    return n > 0;
+  }
+
+  /// Decodes an end-to-end [rows][6] output (x1, y1, x2, y2, score, classIndex).
+  /// Coordinates are either input-size pixels or normalized 0-1; both are handled
+  /// like the grid decoder, including the letterbox correction.
+  static List<DetectionResult> _parseEndToEnd(
+    List<dynamic> output,
+    List<String> labels,
+    double threshold,
+    int inputSize,
+    int padX,
+    int padY,
+    int unpadW,
+    int unpadH,
+  ) {
+    double maxCoord = 0.0;
+    for (int i = 0; i < output.length; i++) {
+      final r = output[i];
+      if ((r[4] as double) < threshold) continue;
+      for (int k = 0; k < 4; k++) {
+        final double v = r[k] as double;
+        if (v > maxCoord) maxCoord = v;
+      }
+    }
+    // Scale to canvas pixels: already pixels when any corner is > 1.5.
+    final double toCanvas = maxCoord > 1.5 ? 1.0 : inputSize.toDouble();
+    final bool letterboxed = unpadW > 0 && unpadH > 0;
+
+    final results = <DetectionResult>[];
+    for (int i = 0; i < output.length; i++) {
+      final r = output[i];
+      final double score = r[4] as double;
+      if (score < threshold) continue;
+      final int classId = (r[5] as double).round();
+      final double x1 = (r[0] as double) * toCanvas;
+      final double y1 = (r[1] as double) * toCanvas;
+      final double x2 = (r[2] as double) * toCanvas;
+      final double y2 = (r[3] as double) * toCanvas;
+      final Rect box = letterboxed
+          ? Rect.fromLTRB((x1 - padX) / unpadW, (y1 - padY) / unpadH, (x2 - padX) / unpadW, (y2 - padY) / unpadH)
+          : Rect.fromLTRB(x1 / inputSize, y1 / inputSize, x2 / inputSize, y2 / inputSize);
+      results.add(DetectionResult(
+        className: (classId >= 0 && classId < labels.length) ? labels[classId] : 'unknown (id:$classId)',
+        confidence: score,
+        bbox: box,
+      ));
+    }
+    return _applyNMS(results, iouThreshold: 0.45);
+  }
+
+{% if classifier_enabled %}
+  // ── Region classifier ──────────────────────────────────────────────────────
+  // A class set to "Classify region" in the app builder (e.g. Max_reg) has its
+  // detected box cut out and run through the attached YOLO-cls model, giving a
+  // label such as locked / unlocked. The crop is made exactly like the trainer's:
+  // the box grown by a margin, then (as Ultralytics does for classification)
+  // the shorter side resized to the model size and centre-cropped, RGB 0-1.
+
+  /// className -> the label that counts as PASS.
+  static const Map<String, String> _classClassifyPass = {
+{% set seen_cls = namespace(keys=[]) %}{% for task in models_manifest %}{% for cls, cfg in (task.classOcrConfig or {}).items() %}{% if cfg.classifyEnabled and cfg.classifyPassLabel and cls not in seen_cls.keys %}{% set seen_cls.keys = seen_cls.keys + [cls] %}
+    '{{ cls }}': '{{ cfg.classifyPassLabel }}',
+{% endif %}{% endfor %}{% endfor %}
+  };
+
+  /// className -> minimum confidence; below it the answer is "uncertain" (a fail).
+  static const Map<String, double> _classClassifyMinConf = {
+{% set seen_cls_c = namespace(keys=[]) %}{% for task in models_manifest %}{% for cls, cfg in (task.classOcrConfig or {}).items() %}{% if cfg.classifyEnabled and cfg.classifyPassLabel and cls not in seen_cls_c.keys %}{% set seen_cls_c.keys = seen_cls_c.keys + [cls] %}
+    '{{ cls }}': {{ (cfg.classifyMinConf if cfg.classifyMinConf is number else 0.5) | float }},
+{% endif %}{% endfor %}{% endfor %}
+  };
+
+  /// className -> crop margin (fraction of the box size added on every side).
+  static const Map<String, double> _classClassifyMargin = {
+{% set seen_cls_m = namespace(keys=[]) %}{% for task in models_manifest %}{% for cls, cfg in (task.classOcrConfig or {}).items() %}{% if cfg.classifyEnabled and cfg.classifyPassLabel and cls not in seen_cls_m.keys %}{% set seen_cls_m.keys = seen_cls_m.keys + [cls] %}
+    '{{ cls }}': {{ (cfg.classifyMargin if cfg.classifyMargin is number else 0.12) | float }},
+{% endif %}{% endfor %}{% endfor %}
+  };
+
+  static const String _classifierAsset = '{{ classifier_tflite }}';
+  static const int _classifierInputSize = {{ classifier_input_size }};
+  /// Output-index order of the classifier (its own class names).
+  static const List<String> _classifierLabels = [
+{% for l in classifier_labels %}    '{{ l }}',
+{% endfor %}  ];
+
+  Interpreter? _clsInterpreter;
+  bool _clsLoadTried = false;
+
+  /// Loads the classifier lazily on first use (no screen needs to know about it).
+  Future<Interpreter?> _ensureClassifier() async {
+    if (_clsInterpreter != null || _clsLoadTried) return _clsInterpreter;
+    _clsLoadTried = true;
+    try {
+      _clsInterpreter = await Interpreter.fromAsset(_classifierAsset, options: _cpuOptions());
+      debugPrint('[Classifier] loaded $_classifierAsset (${_classifierLabels.length} labels, input $_classifierInputSize)');
+    } catch (e) {
+      debugPrint('[Classifier] could not load $_classifierAsset: $e');
+    }
+    return _clsInterpreter;
+  }
+
+  /// Classifies the best (highest-confidence) box of every configured class.
+  /// Other boxes, and every box of an unconfigured class, come back unchanged.
+  Future<List<DetectionResult>> _applyClassifier(List<DetectionResult> dets, img.Image source) async {
+    if (dets.isEmpty || _classClassifyPass.isEmpty) return dets;
+    final interp = await _ensureClassifier();
+    if (interp == null) return dets;
+
+    final Map<String, int> bestIdx = {};
+    for (int i = 0; i < dets.length; i++) {
+      final cn = dets[i].className;
+      if (!_classClassifyPass.containsKey(cn)) continue;
+      if (!bestIdx.containsKey(cn) || dets[i].confidence > dets[bestIdx[cn]!].confidence) bestIdx[cn] = i;
+    }
+    final out = List<DetectionResult>.from(dets);
+    for (final e in bestIdx.entries) {
+      out[e.value] = await _classifyRegion(dets[e.value], source, interp);
+    }
+    return out;
+  }
+
+  /// The crop the trainer used: the box grown by the class's margin * its own size.
+  static img.Image _cropForClassifier(DetectionResult det, img.Image source) {
+    final double margin = _classClassifyMargin[det.className] ?? 0.12;
+    final double bw = det.bbox.width * source.width;
+    final double bh = det.bbox.height * source.height;
+    final int x1 = (det.bbox.left * source.width - bw * margin).round().clamp(0, source.width - 1);
+    final int y1 = (det.bbox.top * source.height - bh * margin).round().clamp(0, source.height - 1);
+    final int x2 = (det.bbox.right * source.width + bw * margin).round().clamp(x1 + 1, source.width);
+    final int y2 = (det.bbox.bottom * source.height + bh * margin).round().clamp(y1 + 1, source.height);
+    return img.copyCrop(source, x: x1, y: y1, width: x2 - x1, height: y2 - y1);
+  }
+
+  /// Turns class probabilities into the result fields: the winning label (or
+  /// 'uncertain' below the class's minimum confidence) and whether it is the pass label.
+  static DetectionResult _withClassifierAnswer(DetectionResult det, List<double> probs) {
+    final String passLabel = _classClassifyPass[det.className] ?? '';
+    final double minConf = _classClassifyMinConf[det.className] ?? 0.5;
+    int best = 0;
+    for (int i = 1; i < probs.length; i++) {
+      if (probs[i] > probs[best]) best = i;
+    }
+    final String label = best < _classifierLabels.length ? _classifierLabels[best] : 'unknown (id:$best)';
+    final double conf = probs[best];
+    final bool confident = conf >= minConf;
+    debugPrint('[Classifier] ${det.className}: $label ${(conf * 100).toStringAsFixed(1)}% (min ${(minConf * 100).toStringAsFixed(0)}%)');
+    // isClassifierPass: true = confidently the pass label, false = confidently some other
+    // state, null = unsure (below the class's minimum confidence) -- neither pass nor fail.
+    return det.copyWith(
+      classifierLabel: confident ? label : 'uncertain',
+      classifierConfidence: conf,
+      isClassifierPass: confident ? label == passLabel : null,
+    );
+  }
+
+  Future<DetectionResult> _classifyRegion(DetectionResult det, img.Image source, Interpreter interp) async {
+    final crop = _cropForClassifier(det, source);
+    try {
+      final probs = await compute(_runClassifierIsolate, {
+        'cropPngBytes': Uint8List.fromList(img.encodePng(crop)),
+        'interpreter_address': interp.address,
+        'inputSize': _classifierInputSize,
+      });
+      if (probs == null || probs.isEmpty) return det;
+      return _withClassifierAnswer(det, probs);
+    } catch (e) {
+      debugPrint('[Classifier] inference failed: $e');
+      return det;
+    }
+  }
+
+  /// Same as [_applyClassifier] but synchronous, for code already running in a
+  /// background isolate (the live-feed tick path, which has the decoded frame in
+  /// hand and must not hop isolates or re-encode it).
+  static List<DetectionResult> _applyClassifierSync(List<DetectionResult> dets, img.Image source, int interpreterAddress) {
+    if (dets.isEmpty || _classClassifyPass.isEmpty) return dets;
+    final Map<String, int> bestIdx = {};
+    for (int i = 0; i < dets.length; i++) {
+      final cn = dets[i].className;
+      if (!_classClassifyPass.containsKey(cn)) continue;
+      if (!bestIdx.containsKey(cn) || dets[i].confidence > dets[bestIdx[cn]!].confidence) bestIdx[cn] = i;
+    }
+    final out = List<DetectionResult>.from(dets);
+    for (final e in bestIdx.entries) {
+      try {
+        final probs = _classifyCrop(_cropForClassifier(dets[e.value], source), interpreterAddress, _classifierInputSize);
+        if (probs != null && probs.isNotEmpty) out[e.value] = _withClassifierAnswer(dets[e.value], probs);
+      } catch (e2) {
+        debugPrint('[Classifier] tick inference failed: $e2');
+      }
+    }
+    return out;
+  }
+
+  /// Isolate entry-point for the single-photo path: decodes the PNG crop, then [_classifyCrop].
+  static List<double>? _runClassifierIsolate(Map<String, dynamic> args) {
+    final crop = img.decodePng(args['cropPngBytes'] as Uint8List);
+    if (crop == null) return null;
+    return _classifyCrop(crop, args['interpreter_address'] as int, args['inputSize'] as int);
+  }
+
+  /// Ultralytics classification preprocessing (shorter side -> size, centre
+  /// crop, RGB 0-1) + one interpreter.run(). Returns class probabilities, or
+  /// null on an input-shape mismatch (checked first so a wrong model can't
+  /// hard-abort the app inside the native layer).
+  static List<double>? _classifyCrop(img.Image crop, int interpreterAddress, int size) {
+    final interpreter = Interpreter.fromAddress(interpreterAddress);
+
+    final inShape = interpreter.getInputTensor(0).shape; // [1, size, size, 3]
+    if (inShape.length != 4 || inShape[1] != size || inShape[2] != size || inShape[3] != 3) {
+      debugPrint('[Classifier] input shape mismatch: model expects $inShape, app feeds [1, $size, $size, 3]');
+      return null;
+    }
+
+    final double scale = size / (crop.width < crop.height ? crop.width : crop.height);
+    final int rw = (crop.width * scale).round() < size ? size : (crop.width * scale).round();
+    final int rh = (crop.height * scale).round() < size ? size : (crop.height * scale).round();
+    final resized = img.copyResize(crop, width: rw, height: rh, interpolation: img.Interpolation.linear);
+    final int left = ((rw - size) / 2).floor();
+    final int top = ((rh - size) / 2).floor();
+
+    final buffer = Float32List(size * size * 3);
+    int idx = 0;
+    for (int y = 0; y < size; y++) {
+      for (int x = 0; x < size; x++) {
+        final p = resized.getPixel(left + x, top + y);
+        buffer[idx++] = p.r.toDouble() / 255.0;
+        buffer[idx++] = p.g.toDouble() / 255.0;
+        buffer[idx++] = p.b.toDouble() / 255.0;
+      }
+    }
+
+    final outShape = interpreter.getOutputTensor(0).shape; // [1, numClasses]
+    if (outShape.length != 2) return null;
+    final output = List.generate(outShape[0], (_) => List.filled(outShape[1], 0.0));
+    interpreter.run(buffer.reshape([1, size, size, 3]), output);
+
+    final raw = List<double>.from(output[0]);
+    // The export already ends in a softmax; apply one only if these aren't probabilities.
+    double sum = 0;
+    bool negative = false;
+    for (final v in raw) {
+      sum += v;
+      if (v < 0) negative = true;
+    }
+    if (negative || (sum - 1.0).abs() > 0.05) {
+      double m = raw[0];
+      for (final v in raw) {
+        if (v > m) m = v;
+      }
+      double total = 0;
+      final exps = raw.map((v) {
+        final e = math.exp(v - m);
+        total += e;
+        return e;
+      }).toList();
+      return exps.map((e) => e / total).toList();
+    }
+    return raw;
+  }
+{% endif %}
+
+  // Non-Max Suppression: removes duplicate overlapping boxes, keeps highest confidence per object
+  static List<DetectionResult> _applyNMS(List<DetectionResult> detections, {double iouThreshold = 0.45}) {
+    if (detections.isEmpty) return detections;
+
+    final sorted = List<DetectionResult>.from(detections)
+      ..sort((a, b) => b.confidence.compareTo(a.confidence));
+
+    final kept = <DetectionResult>[];
+    final suppressed = List<bool>.filled(sorted.length, false);
+
+    for (int i = 0; i < sorted.length; i++) {
+      if (suppressed[i]) continue;
+      kept.add(sorted[i]);
+      for (int j = i + 1; j < sorted.length; j++) {
+        if (suppressed[j]) continue;
+        // Suppress same-class duplicates at normal threshold (0.45)
+        // Also suppress cross-class boxes that nearly fully overlap (0.85)
+        // — handles model detecting same physical object under two class names
+        final iou = _iou(sorted[i].bbox, sorted[j].bbox);
+        if ((sorted[i].className == sorted[j].className && iou > iouThreshold) ||
+            (sorted[i].className != sorted[j].className && iou > 0.85)) {
+          suppressed[j] = true;
+        }
+      }
+    }
+    return kept;
+  }
+
+  static double _iou(Rect a, Rect b) {
+    final interLeft = a.left > b.left ? a.left : b.left;
+    final interTop = a.top > b.top ? a.top : b.top;
+    final interRight = a.right < b.right ? a.right : b.right;
+    final interBottom = a.bottom < b.bottom ? a.bottom : b.bottom;
+
+    if (interRight <= interLeft || interBottom <= interTop) return 0.0;
+
+    final interArea = (interRight - interLeft) * (interBottom - interTop);
+    final unionArea = a.width * a.height + b.width * b.height - interArea;
+    return unionArea <= 0 ? 0.0 : interArea / unionArea;
+  }
+}
+
+class _RawOutput {
+  final List<dynamic> output;
+  final List<int> shape;
+  final List<dynamic>? protos;
+  final List<int>? protoShape;
+  _RawOutput(this.output, this.shape, this.protos, this.protoShape);
+}
+
+class _SegInfo {
+  final List<double> coeffs;
+  final Rect canvasBox;
+  _SegInfo(this.coeffs, this.canvasBox);
+}

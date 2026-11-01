@@ -1,0 +1,371 @@
+import 'dart:async';
+import 'dart:io';
+import 'package:camera/camera.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+/// Camera settings remembered on the phone between scans and app restarts.
+/// The zoom is set once for how the phone sits (e.g. inside a bonnet) and is
+/// re-applied every time a camera starts, on the photo and live inspection screens.
+class CameraPrefs {
+  static const String _zoomKey = 'camera_zoom';
+
+  static Future<double> getZoom() async {
+    try {
+      return (await SharedPreferences.getInstance()).getDouble(_zoomKey) ?? 1.0;
+    } catch (_) {
+      return 1.0;
+    }
+  }
+
+  static Future<void> setZoom(double zoom) async {
+    try {
+      await (await SharedPreferences.getInstance()).setDouble(_zoomKey, zoom);
+    } catch (_) {}
+  }
+
+  static const String _autofocusKey = 'camera_autofocus';
+
+  /// Photo inspection autofocus (default off = camera untouched, as before).
+  /// The live inspection always forces autofocus regardless of this.
+  static Future<bool> getAutofocus() async {
+    try {
+      return (await SharedPreferences.getInstance()).getBool(_autofocusKey) ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> setAutofocus(bool on) async {
+    try {
+      await (await SharedPreferences.getInstance()).setBool(_autofocusKey, on);
+    } catch (_) {}
+  }
+
+  /// Photo camera: autofocus only when the setting is on; off leaves the camera as it was.
+  static Future<void> applyFocus(dynamic controller) async {
+    try {
+      if (await getAutofocus()) await controller.setFocusMode(FocusMode.auto);
+    } catch (_) {}
+  }
+
+  static const String _debugDlKey = 'debug_auto_download';
+
+  /// Save a small text debug log file after every inspection (default off, for testing).
+  static Future<bool> getDebugDownload() async {
+    try {
+      return (await SharedPreferences.getInstance()).getBool(_debugDlKey) ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> setDebugDownload(bool on) async {
+    try {
+      await (await SharedPreferences.getInstance()).setBool(_debugDlKey, on);
+    } catch (_) {}
+  }
+
+  static const String _liveTimeoutKey = 'live_timeout_seconds';
+
+  /// How long a live inspection watches before it decides on the last frame (default 45 s).
+  static Future<int> getLiveTimeoutSeconds() async {
+    try {
+      final v = (await SharedPreferences.getInstance()).getInt(_liveTimeoutKey) ?? 45;
+      return v.clamp(10, 300);
+    } catch (_) {
+      return 45;
+    }
+  }
+
+  static Future<void> setLiveTimeoutSeconds(int seconds) async {
+    try {
+      await (await SharedPreferences.getInstance()).setInt(_liveTimeoutKey, seconds.clamp(10, 300));
+    } catch (_) {}
+  }
+
+  static const String _liveTasksKey = 'live_task_names';
+
+  /// Names of the tasks that use live inspection after the VIN scan (all others use photo).
+  static Future<Set<String>> getLiveTasks() async {
+    try {
+      return ((await SharedPreferences.getInstance()).getStringList(_liveTasksKey) ?? <String>[]).toSet();
+    } catch (_) {
+      return <String>{};
+    }
+  }
+
+  static Future<void> setLiveTasks(Set<String> names) async {
+    try {
+      await (await SharedPreferences.getInstance()).setStringList(_liveTasksKey, names.toList());
+    } catch (_) {}
+  }
+
+  static const String _threadsKey = 'tflite_threads';
+
+  /// TFLite CPU threads; 0 = automatic (min(4, cores)).
+  static Future<int> getThreads() async {
+    try {
+      return (await SharedPreferences.getInstance()).getInt(_threadsKey) ?? 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  static Future<void> setThreads(int threads) async {
+    try {
+      await (await SharedPreferences.getInstance()).setInt(_threadsKey, threads);
+    } catch (_) {}
+  }
+}
+
+/// Eyes-free feedback for a live inspection result (hands are in the bonnet, the screen
+/// cannot be watched): strong vibration + a loud tone, a different pattern per outcome.
+/// Uses a native channel (full-amplitude vibration, alarm-stream tone) because Flutter's
+/// HapticFeedback is only a light tick on many phones. Falls back to it if the channel fails.
+/// Both can be switched off in Settings. Never throws.
+class ResultFeedback {
+  static const MethodChannel _ch = MethodChannel('{{ package_name }}/feedback');
+  static const String _vibKey = 'feedback_vibrate';
+  static const String _soundKey = 'feedback_sound';
+
+  static Future<bool> getVibrate() async {
+    try { return (await SharedPreferences.getInstance()).getBool(_vibKey) ?? true; } catch (_) { return true; }
+  }
+  static Future<void> setVibrate(bool on) async {
+    try { await (await SharedPreferences.getInstance()).setBool(_vibKey, on); } catch (_) {}
+  }
+  static Future<bool> getSound() async {
+    try { return (await SharedPreferences.getInstance()).getBool(_soundKey) ?? true; } catch (_) { return true; }
+  }
+  static Future<void> setSound(bool on) async {
+    try { await (await SharedPreferences.getInstance()).setBool(_soundKey, on); } catch (_) {}
+  }
+
+  // Custom sound per outcome ('ok' / 'notOk'), picked from the phone's storage and copied
+  // into the app. Stored as 'path|display name'.
+  static Future<String?> getCustomTone(String slot) async {
+    try { return (await SharedPreferences.getInstance()).getString('feedback_tone_$slot'); } catch (_) { return null; }
+  }
+  static Future<void> setCustomTone(String slot, String? v) async {
+    try {
+      final sp = await SharedPreferences.getInstance();
+      if (v == null) { await sp.remove('feedback_tone_$slot'); } else { await sp.setString('feedback_tone_$slot', v); }
+    } catch (_) {}
+  }
+
+  /// Opens the system file picker for an audio file. Returns 'path|name' or null if cancelled.
+  static Future<String?> pickTone(String slot) async {
+    try {
+      final r = await _ch.invokeMethod<String>('pickTone', {'slot': slot});
+      if (r != null) await setCustomTone(slot, r);
+      return r;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Plays the chosen file for [slot]; returns false if there is none (or it failed).
+  static Future<bool> _playCustom(String slot) async {
+    final v = await getCustomTone(slot);
+    if (v == null) return false;
+    try {
+      await _ch.invokeMethod('playFile', {'path': v.split('|').first});
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // Tone names, mapped to android.media.ToneGenerator constants in MainActivity.
+  static const String _toneAck = 'ack';        // OK: happy two-tone
+  static const String _toneNack = 'nack';      // not found
+  static const String _toneAlert = 'alert';    // NOT OK: harsh
+
+  /// [outcome]: 'ok' = 1 beep + 1 buzz, 'notOk' = 2 beeps + 2 buzzes, 'notFound' = 3 beeps + 3 buzzes.
+  static Future<void> _beeps(String tone, int n, int ms, int gap) async {
+    for (var i = 0; i < n; i++) {
+      await _ch.invokeMethod('tone', {'tone': tone, 'ms': ms});
+      if (i < n - 1) await Future.delayed(Duration(milliseconds: gap));
+    }
+  }
+
+  /// What the native side did for the last vibration (ringer mode, DND, amplitude support, call used).
+  static String lastDiag = '';
+
+  static Future<void> _vibrate(List<int> pattern) async {
+    try {
+      lastDiag = (await _ch.invokeMethod<String>('vibrate', {'pattern': pattern})) ?? '';
+    } catch (e) {
+      lastDiag = 'vibrate call failed: $e';
+      rethrow;
+    }
+  }
+
+  static Future<void> play(String outcome) async {
+    final bool vib = await getVibrate();
+    final bool snd = await getSound();
+    try {
+      if (outcome == 'ok') {
+        if (vib) unawaited(_vibrate([0, 500]));
+        if (snd && !await _playCustom('ok')) await _beeps(_toneAck, 1, 500, 0);
+      } else if (outcome == 'notOk') {
+        if (vib) unawaited(_vibrate([0, 300, 200, 300]));
+        if (snd && !await _playCustom('notOk')) await _beeps(_toneAlert, 2, 300, 300);
+      } else {
+        if (vib) unawaited(_vibrate([0, 250, 200, 250, 200, 250]));
+        if (snd) await _beeps(_toneNack, 3, 250, 250);
+      }
+    } catch (_) {
+      // Native channel unavailable: fall back to Flutter's built-in (weaker) feedback.
+      try {
+        if (vib) unawaited(HapticFeedback.vibrate());
+        if (snd) unawaited(SystemSound.play(SystemSoundType.alert));
+      } catch (_) {}
+    }
+  }
+}
+
+
+/// Phone heat / battery for debugging long continuous use: battery temperature, OS thermal
+/// status (Android 10+), battery % and charging. [refresh] is async and cheap; [summary] is the
+/// last value read, ready to append to a log line. Never throws.
+class DeviceStats {
+  static const MethodChannel _ch = MethodChannel('{{ package_name }}/feedback');
+  static String summary = 'heat: n/a';
+  static String info = '';          // app version / phone model / Android version
+  static DateTime? _lastWarn;
+  static const _thermal = ['none', 'light', 'moderate', 'severe', 'critical', 'emergency', 'shutdown'];
+
+  static Future<String> refresh() async {
+    try {
+      final m = await _ch.invokeMapMethod<String, dynamic>('deviceStats');
+      if (m != null) {
+        info = 'app ${m['appVersion']} | ${m['model']} | Android ${m['android']}';
+        final int th = (m['thermal'] as int?) ?? -1;
+        summary = 'heat: battery ${(m['tempC'] as num).toStringAsFixed(1)}C, thermal ${th >= 0 && th < _thermal.length ? _thermal[th] : 'n/a'}, '
+            'battery ${m['level']}%${m['charging'] == true ? ' charging' : ''}';
+        if (th >= 3 && (_lastWarn == null || DateTime.now().difference(_lastWarn!).inSeconds > 30)) {
+          _lastWarn = DateTime.now();
+          ScanLog.add('${DateTime.now().toString().split('.').first.split(' ').last} | WARNING: phone is overheating (thermal ${_thermal[th]}, ${(m['tempC'] as num).toStringAsFixed(1)}C) - the OS may slow the CPU');
+        }
+      }
+    } catch (_) {}
+    return summary;
+  }
+}
+
+/// The full debug log of the most recent scan (live or photo), kept after the scan screen closes so it
+/// can still be read after "submit". The on-screen debug console only shows the newest 50 lines and
+/// vanishes with the screen; this keeps up to [_max] lines, persisted on the phone.
+class ScanLog {
+  static final List<String> _lines = [];
+  static const int _max = 1500;
+  static const String _key = 'scan_log_last';
+
+  /// A new scan screen opened: start a fresh log (the previous one stays on disk until this one saves).
+  static String _title = 'scan';
+
+  static void begin(String title) {
+    _lines.clear();
+    _title = title;
+    add('=== $title  ${DateTime.now().toString().split('.').first} ===');
+    add('device: ${Platform.numberOfProcessors} CPU cores');
+    DeviceStats.refresh().then((s) => add('$s | ${DeviceStats.info}'));
+    // Compact timeline: one heat/battery line every 10 s while the scan screen is open.
+    _timer?.cancel();
+    _timer = Timer.periodic(const Duration(seconds: 10), (_) async {
+      add('${DateTime.now().toString().split('.').first.split(' ').last} | ${await DeviceStats.refresh()}');
+    });
+  }
+
+  static Timer? _timer;
+
+  static void add(String line) {
+    _lines.add(line);
+    if (_lines.length > _max) _lines.removeAt(0);
+  }
+
+  static Future<void> save() async {
+    _timer?.cancel();
+    _timer = null;
+    if (_lines.isEmpty) return;
+    try {
+      await (await SharedPreferences.getInstance()).setStringList(_key, List<String>.from(_lines));
+    } catch (_) {}
+    // Settings > "Download debug log": also drop a small text file per inspection.
+    try {
+      if (!await CameraPrefs.getDebugDownload()) return;
+      add('end ${await DeviceStats.refresh()}');
+      final stamp = DateTime.now().toString().split('.').first.replaceAll(RegExp(r'[^0-9]'), '');
+      final safe = _title.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
+      final dir = Directory('/storage/emulated/0/Pictures/MAI/${'{{ app_name }}'.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_')}/DebugLogs');
+      await dir.create(recursive: true);
+      await File('${dir.path}/${safe}_$stamp.txt').writeAsString(_lines.join('\n'));
+    } catch (_) {}
+  }
+
+  static Future<List<String>> load() async {
+    if (_lines.isNotEmpty) return List<String>.from(_lines);
+    try {
+      return (await SharedPreferences.getInstance()).getStringList(_key) ?? <String>[];
+    } catch (_) {
+      return <String>[];
+    }
+  }
+}
+
+/// Opens the last scan's full debug log (oldest first) with Copy, from anywhere in the app.
+Future<void> showLastScanLog(BuildContext context) async {
+  final lines = await ScanLog.load();
+  if (!context.mounted) return;
+  await showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    backgroundColor: const Color(0xFF111118),
+    builder: (ctx) => SizedBox(
+      height: MediaQuery.of(ctx).size.height * 0.85,
+      child: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 8, 4),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text('Last scan log (${lines.length} lines)',
+                      style: const TextStyle(color: Colors.yellow, fontWeight: FontWeight.bold, fontSize: 15)),
+                ),
+                TextButton(
+                  onPressed: lines.isEmpty
+                      ? null
+                      : () {
+                          Clipboard.setData(ClipboardData(text: lines.join('\n')));
+                          ScaffoldMessenger.of(ctx).showSnackBar(const SnackBar(content: Text('Log copied')));
+                        },
+                  child: const Text('Copy all'),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.close, color: Colors.white),
+                  onPressed: () => Navigator.pop(ctx),
+                ),
+              ],
+            ),
+          ),
+          const Divider(color: Colors.white24, height: 1),
+          Expanded(
+            child: lines.isEmpty
+                ? const Center(child: Text('No scan has been logged yet.', style: TextStyle(color: Colors.white70)))
+                : SingleChildScrollView(
+                    padding: const EdgeInsets.all(12),
+                    child: SelectableText(
+                      lines.join('\n'),
+                      style: const TextStyle(color: Color(0xFF9FFF9F), fontSize: 11, fontFamily: 'monospace'),
+                    ),
+                  ),
+          ),
+        ],
+      ),
+    ),
+  );
+}

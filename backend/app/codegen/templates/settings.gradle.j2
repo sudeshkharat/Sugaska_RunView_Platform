@@ -1,0 +1,72 @@
+pluginManagement {
+    def flutterSdkPath = {
+        def properties = new Properties()
+        def localPropertiesFile = file("local.properties")
+        if (localPropertiesFile.exists()) {
+            localPropertiesFile.withInputStream { properties.load(it) }
+        }
+        def flutterSdkPath = properties.getProperty("flutter.sdk")
+        if (flutterSdkPath == null) {
+            flutterSdkPath = System.getenv("FLUTTER_ROOT") ?: System.getenv("FLUTTER_HOME")
+        }
+        return flutterSdkPath
+    }()
+
+    includeBuild("$flutterSdkPath/packages/flutter_tools/gradle")
+
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+plugins {
+    id "dev.flutter.flutter-gradle-plugin" version "1.0.0" apply false
+    id "com.android.application" version "8.7.0" apply false
+    id "org.jetbrains.kotlin.android" version "{{ kotlin_version }}" apply false
+}
+
+include ":app"
+
+// ---------------------------------------------------------------------------
+// Plugin path discovery.
+// Flutter < 3.19 generates .flutter-plugins (key=value).
+// Flutter >= 3.19 generates .flutter-plugins-dependencies (JSON) instead.
+// We try the legacy file first, then fall back to the JSON one.
+// ---------------------------------------------------------------------------
+def flutterPluginsFile     = new File(rootDir.parent, '.flutter-plugins')
+def flutterPluginsDepsFile = new File(rootDir.parent, '.flutter-plugins-dependencies')
+
+def includePlugin = { String pluginName, String pluginPath ->
+    // Strip any trailing slash / backslash Flutter may append
+    while (pluginPath.endsWith('/') || pluginPath.endsWith('\\')) {
+        pluginPath = pluginPath[0..-2]
+    }
+    def androidDir = new File(pluginPath, 'android')
+    if (androidDir.exists() && androidDir.isDirectory()) {
+        include ":${pluginName}"
+        project(":${pluginName}").projectDir = androidDir
+    } else {
+        println "[settings] WARNING: plugin '${pluginName}' android dir not found at ${androidDir.path} -- skipping"
+    }
+}
+
+if (flutterPluginsFile.exists()) {
+    // Legacy format: one "name=path" per line
+    flutterPluginsFile.eachLine { String line ->
+        line = line.trim()
+        if (line.isEmpty() || line.startsWith('#')) return
+        def eqIdx = line.indexOf('=')
+        if (eqIdx < 0) return
+        includePlugin(line.substring(0, eqIdx).trim(), line.substring(eqIdx + 1).trim())
+    }
+} else if (flutterPluginsDepsFile.exists()) {
+    // New JSON format: { "plugins": { "android": [ { "name": "...", "path": "..." } ] } }
+    def json = new groovy.json.JsonSlurper().parse(flutterPluginsDepsFile)
+    (json?.plugins?.android ?: []).each { plugin ->
+        includePlugin(plugin.name as String, plugin.path as String)
+    }
+} else {
+    println "[settings] WARNING: neither .flutter-plugins nor .flutter-plugins-dependencies found at ${rootDir.parent} -- run 'flutter pub get' first"
+}

@@ -1,0 +1,499 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
+import 'package:camera/camera.dart';
+import 'package:flutter/material.dart';
+import 'package:drift/drift.dart' as drift;
+import 'package:permission_handler/permission_handler.dart';
+import '../database/database.dart';
+import '../ml/detection_result.dart';
+import '../ml/ocr_recognizer.dart';
+import '../widgets/detection_overlay.dart';
+import 'history_screen.dart';
+
+/// Capture -> detect plate/chars -> read the string ('{{ ocr_engine }}'
+/// engine, baked in at generation time) -> show + save. This is the OCR
+/// counterpart to scan_screen.dart / home_screen.dart's inspection flow,
+/// kept intentionally self-contained rather than reusing the multi-task
+/// inspection screens, since a plate read is a single result, not a task
+/// checklist.
+///
+/// [truthValue], when set, comes from a QR/barcode scan of the engine's
+/// sticker (see ocr_qr_scan_screen.dart) -- a checksum-protected read that's
+/// trustworthy in a way no OCR ever is. The camera read gets checked
+/// against it, and only falls back to Google ML Kit on a mismatch.
+class OcrScanScreen extends StatefulWidget {
+  final List<CameraDescription> cameras;
+  final String? truthValue;
+  const OcrScanScreen({super.key, required this.cameras, this.truthValue});
+
+  @override
+  State<OcrScanScreen> createState() => _OcrScanScreenState();
+}
+
+class _OcrScanScreenState extends State<OcrScanScreen> with WidgetsBindingObserver {
+  CameraController? _controller;
+  bool _cameraReady = false;
+  bool _modelReady = false;
+  bool _processing = false;
+  OcrResult? _lastResult;
+  Uint8List? _lastPhotoBytes;
+  // Natural pixel size of _lastPhotoBytes -- needed so the box overlay
+  // (drawn in an AspectRatio matching the photo, not the live camera
+  // preview) lines up with result.boxes, which are normalized to that same
+  // photo's own width/height.
+  Size? _lastPhotoSize;
+  String? _error;
+  // No detector is flawless on every frame -- a stray extra character or a
+  // misread digit should be a quick edit before saving, not a retake.
+  final TextEditingController _textController = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _initCamera();
+    _loadModels();
+  }
+
+  Future<void> _initCamera() async {
+    if (widget.cameras.isEmpty) return;
+    final backCamera = widget.cameras.firstWhere(
+      (c) => c.lensDirection == CameraLensDirection.back,
+      orElse: () => widget.cameras.first,
+    );
+    _controller = CameraController(backCamera, ResolutionPreset.high, enableAudio: false);
+    try {
+      await _controller!.initialize();
+      if (mounted) setState(() => _cameraReady = true);
+    } catch (e) {
+      if (mounted) setState(() => _error = 'Camera error: $e');
+    }
+  }
+
+  Future<void> _loadModels() async {
+    try {
+      await OcrRecognizer().load(
+        detectorModelPath: '{{ ocr_detector_tflite | default("", true) }}',
+        detectorLabelsPath: '{{ ocr_detector_labels | default("", true) }}',
+        recognizerModelPath: '{{ ocr_recognizer_tflite | default("", true) }}',
+        charsetPath: '{{ ocr_recognizer_charset | default("", true) }}',
+        metaPath: {% if ocr_recognizer_meta %}'{{ ocr_recognizer_meta }}'{% else %}null{% endif %},
+      );
+      if (mounted) setState(() => _modelReady = true);
+    } catch (e) {
+      if (mounted) setState(() => _error = 'Could not load OCR models: $e');
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (_controller == null || !_controller!.value.isInitialized) return;
+    if (state == AppLifecycleState.inactive) {
+      _controller?.dispose();
+    } else if (state == AppLifecycleState.resumed) {
+      _initCamera();
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _controller?.dispose();
+    _textController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _captureAndRead() async {
+    if (_controller == null || !_controller!.value.isInitialized || !_modelReady || _processing) return;
+    setState(() {
+      _processing = true;
+      _error = null;
+    });
+    try {
+      final file = await _controller!.takePicture();
+      final bytes = await file.readAsBytes();
+      final result = await OcrRecognizer().recognize(bytes, truthValue: widget.truthValue);
+
+      // Decode just for its width/height -- result.boxes are normalized
+      // against the photo's own dimensions, so the overlay needs them to
+      // place boxes correctly regardless of how the photo is displayed.
+      Size? photoSize;
+      try {
+        final codec = await ui.instantiateImageCodec(bytes);
+        final frame = await codec.getNextFrame();
+        photoSize = Size(frame.image.width.toDouble(), frame.image.height.toDouble());
+      } catch (e) {
+        debugPrint('[OCR] Could not read photo dimensions for overlay: $e');
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _lastResult = result;
+        _lastPhotoBytes = bytes;
+        _lastPhotoSize = photoSize;
+        _textController.text = result.text;
+        _processing = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = 'Read failed: $e';
+        _processing = false;
+      });
+    }
+  }
+
+  /// Saves the captured photo under the same Pictures/MAI/{app}/... tree
+  /// the inspection screens already use, so it shows up alongside them
+  /// and survives an app reinstall/PC sync the same way. Returns null (and
+  /// the save falls back to no image) if storage permission is denied --
+  /// the read itself still gets saved either way.
+  Future<String?> _savePhoto(String label) async {
+    try {
+      PermissionStatus status = await Permission.photos.request();
+      if (!status.isGranted) status = await Permission.storage.request();
+      if (!status.isGranted) return null;
+
+      final baseDir = Directory('/storage/emulated/0/Pictures');
+      final appName = '{{ app_name }}'.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
+      final safeLabel = label.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
+      final imgDir = Directory('${baseDir.path}/MAI/$appName/OCR/$safeLabel');
+      await imgDir.create(recursive: true);
+
+      final now = DateTime.now();
+      final dateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+      final timeStr = '${now.hour.toString().padLeft(2, '0')}-${now.minute.toString().padLeft(2, '0')}-${now.second.toString().padLeft(2, '0')}';
+      final path = '${imgDir.path}/ocr_${dateStr}_$timeStr.jpg';
+      await File(path).writeAsBytes(_lastPhotoBytes!, flush: true);
+      return path;
+    } catch (e) {
+      debugPrint('[OCR] Could not save photo: $e');
+      return null;
+    }
+  }
+
+  Future<void> _saveResult() async {
+    final result = _lastResult;
+    final text = _textController.text.trim();
+    if (result == null || text.isEmpty) return;
+
+    String? imagePath;
+    if (_lastPhotoBytes != null) {
+      imagePath = await _savePhoto(widget.truthValue ?? text);
+    }
+
+    final detectionsJson = result.boxes.isEmpty
+        ? null
+        : jsonEncode(result.boxes.map((b) => b.toJson()).toList());
+
+    // With a truth value, an unedited mismatch should still record as a
+    // fail even if the operator saves without correcting it -- success
+    // reflects the edited text actually matching, not just "a read happened".
+    final normText = text.toUpperCase().replaceAll(RegExp(r'\s+'), '');
+    final normTruth = widget.truthValue?.toUpperCase().replaceAll(RegExp(r'\s+'), '');
+    final success = normTruth == null ? true : normText == normTruth;
+
+    final inspectionId = await db.saveInspection(InspectionsCompanion.insert(
+      vin: widget.truthValue ?? text,
+      modelCode: 'OCR',
+    ));
+    await db.saveTaskResult(TaskResultsCompanion.insert(
+      inspectionId: inspectionId,
+      taskName: 'ocr_read',
+      className: text,
+      confidence: result.confidence ?? 0.0,
+      success: success,
+      imagePath: drift.Value(imagePath),
+      detectionsJson: drift.Value(detectionsJson),
+    ));
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(success ? 'Saved (OK)' : 'Saved (NOT OK -- did not match truth value)'),
+        backgroundColor: success ? Colors.green : Colors.red,
+      ),
+    );
+    setState(() {
+      _lastResult = null;
+      _lastPhotoBytes = null;
+      _lastPhotoSize = null;
+      _textController.clear();
+    });
+  }
+
+  void _scanAgain() => setState(() {
+        _lastResult = null;
+        _lastPhotoBytes = null;
+        _lastPhotoSize = null;
+        _textController.clear();
+      });
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('{{ app_name }}'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.history),
+            tooltip: 'History',
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const HistoryScreen()),
+            ),
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                if (_cameraReady && _controller != null)
+                  CameraPreview(_controller!)
+                else
+                  const Center(child: CircularProgressIndicator()),
+                if (!_modelReady && _error == null)
+                  const Positioned(
+                    top: 16,
+                    left: 16,
+                    right: 16,
+                    child: Text(
+                      'Loading OCR models...',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: Colors.white, backgroundColor: Colors.black54),
+                    ),
+                  ),
+                if (_processing)
+                  Container(
+                    color: Colors.black.withOpacity(0.4),
+                    child: const Center(child: CircularProgressIndicator()),
+                  ),
+              ],
+            ),
+          ),
+          if (_error != null)
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: Text(_error!, style: const TextStyle(color: Colors.red)),
+            ),
+          if (_lastResult != null) _buildResultPanel(_lastResult!),
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: _lastResult == null
+                ? ElevatedButton.icon(
+                    onPressed: _modelReady && !_processing ? _captureAndRead : null,
+                    icon: const Icon(Icons.camera_alt),
+                    label: const Text('Capture & Read'),
+                    style: ElevatedButton.styleFrom(minimumSize: const Size(double.infinity, 52)),
+                  )
+                : Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: _scanAgain,
+                          child: const Text('Scan Again'),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: ElevatedButton(
+                          onPressed: _saveResult,
+                          child: const Text('Save'),
+                        ),
+                      ),
+                    ],
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildResultPanel(OcrResult result) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      color: Colors.black87,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (_lastPhotoBytes != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: _lastPhotoSize != null
+                    ? AspectRatio(
+                        // Matches the photo's own aspect ratio (not a fixed
+                        // height) so the overlay's normalized boxes line up
+                        // with the pixels they were detected on -- BoxFit.cover
+                        // at a fixed height would crop/scale the photo
+                        // differently than the boxes assume.
+                        aspectRatio: _lastPhotoSize!.width / _lastPhotoSize!.height,
+                        child: Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            Image.memory(_lastPhotoBytes!, fit: BoxFit.fill),
+                            if (result.boxes.isNotEmpty)
+                              DetectionOverlay(
+                                results: result.boxes,
+                                previewSize: _lastPhotoSize!,
+                              ),
+                          ],
+                        ),
+                      )
+                    : Image.memory(_lastPhotoBytes!, height: 140, fit: BoxFit.cover, width: double.infinity),
+              ),
+            ),
+          if (result.matched != null)
+            Container(
+              margin: const EdgeInsets.only(bottom: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: result.matched! ? Colors.green.shade700 : Colors.red.shade700,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Text(
+                result.matched! ? 'OK -- matches truth value' : 'NOT OK -- does not match truth value',
+                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13),
+              ),
+            ),
+          if (result.truthValue != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 4),
+              child: Text(
+                'Truth value (QR): ${result.truthValue}',
+                style: const TextStyle(color: Colors.white70, fontSize: 13),
+              ),
+            ),
+          TextField(
+            controller: _textController,
+            autocorrect: false,
+            enableSuggestions: false,
+            textCapitalization: TextCapitalization.characters,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 28,
+              fontWeight: FontWeight.bold,
+              letterSpacing: 2,
+            ),
+            decoration: InputDecoration(
+              isDense: true,
+              border: InputBorder.none,
+              hintText: result.text.isEmpty ? '(no text detected -- type it in)' : null,
+              hintStyle: const TextStyle(color: Colors.white38, fontSize: 20),
+            ),
+          ),
+          const Padding(
+            padding: EdgeInsets.only(top: 2),
+            child: Text(
+              'Tap to correct before saving',
+              style: TextStyle(color: Colors.white38, fontSize: 12),
+            ),
+          ),
+          if (result.confidence != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                'Confidence: ${(result.confidence! * 100).toStringAsFixed(1)}%',
+                style: const TextStyle(color: Colors.white70),
+              ),
+            ),
+          // Per-character read: which character the recognizer actually
+          // read at each detected box and how confident it was -- the CNN
+          // engine reads one box per character, so this is the same
+          // breakdown the training tool's OCR test panel shows (text +
+          // per-character confidence), previously dropped on the floor here
+          // even though OcrResult.boxes already carried it.
+          if (result.engine == 'cnn' && result.boxes.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: result.boxes.map((b) {
+                  final color = b.confidence >= 0.8
+                      ? Colors.green.shade600
+                      : b.confidence >= 0.5
+                          ? Colors.lightBlue.shade400
+                          : Colors.red.shade400;
+                  return Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: color.withOpacity(0.25),
+                      border: Border.all(color: color),
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: Text(
+                      '${b.className}  ${(b.confidence * 100).toStringAsFixed(0)}%',
+                      style: TextStyle(color: color, fontWeight: FontWeight.bold, fontSize: 13),
+                    ),
+                  );
+                }).toList(),
+              ),
+            ),
+          // Character-by-character comparison against the QR-scanned truth
+          // value -- pinpoints exactly which position the read went wrong
+          // at, instead of just an overall OK/NOT OK.
+          if (result.truthValue != null && result.truthValue!.trim().isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Builder(builder: (context) {
+                final truth = result.truthValue!.toUpperCase().replaceAll(RegExp(r'\s+'), '');
+                final read = result.text.toUpperCase().replaceAll(RegExp(r'\s+'), '');
+                final maxLen = truth.length > read.length ? truth.length : read.length;
+                return RichText(
+                  text: TextSpan(
+                    style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, letterSpacing: 1.5),
+                    children: List.generate(maxLen, (i) {
+                      final t = i < truth.length ? truth[i] : '';
+                      final r = i < read.length ? read[i] : '_';
+                      final ok = t.isNotEmpty && t == r;
+                      return TextSpan(
+                        text: r,
+                        style: TextStyle(color: ok ? Colors.green.shade400 : Colors.red.shade400),
+                      );
+                    }),
+                  ),
+                );
+              }),
+            ),
+          // Debug-only side-by-side comparison panel: CRNN is always the
+          // production read; ML Kit is only ever populated in a debug build
+          // (see OcrRecognizer.recognize -- `kDebugMode` gate) so this row
+          // is naturally absent from every release APK.
+          if (kDebugMode && result.mlKitText != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                'CRNN: ${result.text} | MLKit: ${result.mlKitText}'
+                '${result.matchedEngine == 'mlkit' ? ' (MLKit matched truth)' : ''}',
+                style: const TextStyle(color: Colors.amberAccent, fontSize: 13),
+              ),
+            ),
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(
+              'Debug: ${result.totalBoxesFound} boxes found, source: ${result.regionSource}',
+              style: const TextStyle(color: Colors.white38, fontSize: 12),
+            ),
+          ),
+          if (result.detectorDebug.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                result.detectorDebug,
+                style: const TextStyle(color: Colors.white38, fontSize: 11),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}

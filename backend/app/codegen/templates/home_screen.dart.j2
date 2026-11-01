@@ -1,0 +1,832 @@
+import 'package:camera/camera.dart';
+import 'package:flutter/material.dart';
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:drift/drift.dart' as drift;
+import 'inspection_camera_screen.dart';
+import 'live_inspection_camera_screen.dart';
+import 'history_screen.dart';
+import 'printer_discovery_screen.dart';
+import 'sync_screen.dart';
+import '../services/print_service.dart';
+import '../services/camera_prefs.dart';
+import '../services/sync_service.dart';
+import '../services/wifi_service.dart';
+import '../database/database.dart';
+
+class HomeScreen extends StatefulWidget {
+  final List<CameraDescription> cameras;
+  final String? vin;
+  final String? modelCode;
+  const HomeScreen({super.key, required this.cameras, this.vin, this.modelCode});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  List<dynamic> _tasks = [];
+  Set<String> _liveTasks = {}; // tasks set to live video in Settings
+  Map<int, dynamic> _taskResults = {}; // Index -> DetectionResult
+  bool _loading = true;
+
+  // True from the moment Submit is tapped (and past the incomplete/confirm
+  // dialogs) until this screen pops. Grays out the Submit button and shows
+  // a spinner in it instead of leaving it tappable while the DB write and
+  // printer handoff run, so a slow printer connection reads as "working",
+  // not "frozen" -- and a second tap can't fire a duplicate submission.
+  bool _submitting = false;
+
+  /// "NOT OK" means a wrong/defect part was actually detected; "NOT FOUND"
+  /// means the camera simply didn't detect anything for this task at all.
+  /// Those are different problems for the inspector (retake angle vs. a
+  /// real defect), so don't collapse both into "NOT OK".
+  String _resultLabel(int index) {
+    final result = _taskResults[index];
+    if (result == null || result['success'] == true) return 'OK';
+    final className = (result['className'] as String?)?.trim().toLowerCase();
+    if (className == null || className.isEmpty || className == 'none') {
+      return 'NOT FOUND';
+    }
+    return 'NOT OK';
+  }
+
+  void _showReferenceImage(BuildContext context, String assetPath) {
+    showDialog(
+      context: context,
+      builder: (ctx) => Dialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              decoration: const BoxDecoration(
+                color: Color(0xFFDC143C),
+                borderRadius: BorderRadius.only(topLeft: Radius.circular(16), topRight: Radius.circular(16)),
+              ),
+              child: Row(
+                children: [
+                  const Expanded(
+                    child: Text('Reference Image', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 15)),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close, color: Colors.white, size: 20),
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                    onPressed: () => Navigator.pop(ctx),
+                  ),
+                ],
+              ),
+            ),
+            ClipRRect(
+              borderRadius: const BorderRadius.only(bottomLeft: Radius.circular(16), bottomRight: Radius.circular(16)),
+              child: Image.asset(
+                assetPath,
+                fit: BoxFit.contain,
+                errorBuilder: (_, __, ___) => const Padding(
+                  padding: EdgeInsets.all(32),
+                  child: Text('Image not available', style: TextStyle(color: Colors.grey)),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  bool _isLive(int i) => _liveTasks.contains(_tasks[i]['name']);
+
+  /// Runs tasks from [start] (or only [start] on a retake). Each run of consecutive tasks with the
+  /// same mode (live / photo, from Settings) goes to its own screen; stops if the inspector backs out.
+  Future<void> _runTasks(int start, {required bool single}) async {
+    _liveTasks = await CameraPrefs.getLiveTasks();
+    int i = start;
+    final int end = single ? start + 1 : _tasks.length;
+    while (i < end && mounted) {
+      final bool live = _isLive(i);
+      int j = i + 1;
+      while (j < end && _isLive(j) == live) { j++; }
+      final seg = _tasks.sublist(i, j);
+      final result = await Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (context) => live
+              ? LiveInspectionCameraScreen(vin: widget.vin ?? "MANUAL_SCAN", modelCode: widget.modelCode ?? "", tasks: seg, initialIndex: 0)
+              : InspectionCameraScreen(vin: widget.vin ?? "MANUAL_SCAN", modelCode: widget.modelCode ?? "", tasks: seg, initialIndex: 0),
+        ),
+      );
+      if (!mounted) return;
+      if (result == null || result is! Map<int, dynamic>) return;
+      setState(() {
+        result.forEach((k, v) => _taskResults[i + k] = v);
+      });
+      // inspector left before finishing this segment -> don't continue the chain
+      if (!seg.asMap().keys.every((k) => result.containsKey(k))) return;
+      i = j;
+      // let the finished screen release the camera before the next (live/photo) screen opens it
+      await Future.delayed(const Duration(milliseconds: 600));
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _loadTasksAndProgress();
+  }
+
+  Future<void> _loadTasksAndProgress() async {
+    _liveTasks = await CameraPrefs.getLiveTasks();
+    try {
+      // 1. Load tasks from manifest
+      final String manifestStr = await rootBundle.loadString('assets/models_manifest.json');
+      final List<dynamic> manifest = json.decode(manifestStr);
+      
+      final List<dynamic> filtered = manifest.where((task) {
+        if (widget.modelCode == null || widget.modelCode!.isEmpty) return true;
+        return task['vehicle_code'] == widget.modelCode;
+      }).toList();
+
+      // 2. Resume progress from local DB for this VIN, but only if the most
+      // recent inspection for it was left genuinely incomplete (app closed
+      // mid-inspection, etc). Otherwise this is a *new* scan of a VIN that
+      // already has finished inspection history (e.g. a legitimate re-scan)
+      // -- restoring its old per-task results would wrongly show tasks the
+      // inspector hasn't touched yet in this session as already OK/NOT OK.
+      if (widget.vin != null) {
+        final existingResults = await db.getLatestResultsForVin(widget.vin!);
+        if (existingResults.isNotEmpty && existingResults.length < filtered.length) {
+          final Map<int, dynamic> restored = {};
+          for (var res in existingResults) {
+            // Try to match by task name
+            final idx = filtered.indexWhere((t) => t['name'] == res.taskName);
+            if (idx != -1) {
+              restored[idx] = {
+                'className': res.className,
+                'success': res.success,
+                'imagePath': res.imagePath,
+                'backupImagePath': res.backupImagePath,
+                'negativeImagePath': res.negativeImagePath,
+                'detectionsJson': res.detectionsJson,
+              };
+            }
+          }
+          _taskResults = restored;
+        }
+      }
+
+      setState(() {
+        _tasks = filtered;
+        _loading = false;
+      });
+    } catch (e) {
+      setState(() => _loading = false);
+      debugPrint("Load error: $e");
+    }
+  }
+
+  void _submitInspection() async {
+    if (_submitting) return;
+    if (_taskResults.length < _tasks.length) {
+      showDialog(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text("Incomplete Inspection"),
+          content: Text("Please complete all ${_tasks.length} tasks before submitting."),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text("OK")),
+          ],
+        ),
+      );
+      return;
+    }
+
+    // If any task failed, show confirmation dialog before submitting
+    final bool allOk = _taskResults.values.every((r) => r['success'] == true);
+    if (!allOk) {
+      final bool? confirmed = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => _buildSubmitConfirmDialog(),
+      );
+      if (confirmed != true) return;
+    }
+
+    setState(() => _submitting = true);
+
+    // Persist to local DB
+    final inspectionId = await db.saveInspection(InspectionsCompanion.insert(
+      vin: widget.vin ?? 'UNKNOWN',
+      modelCode: widget.modelCode ?? 'UNKNOWN',
+    ));
+
+    for (int i = 0; i < _tasks.length; i++) {
+      final task = _tasks[i];
+      final result = _taskResults[i];
+      final success = result['success'] ?? false;
+
+      await db.saveTaskResult(TaskResultsCompanion.insert(
+        inspectionId: inspectionId,
+        taskName: task['name'],
+        className: result['className'] ?? 'None',
+        confidence: 0.0,
+        success: success,
+        imagePath: drift.Value(result['imagePath'] as String?),
+        backupImagePath: drift.Value(result['backupImagePath'] as String?),
+        negativeImagePath: drift.Value(result['negativeImagePath'] as String?),
+        detectionsJson: drift.Value(result['detectionsJson'] as String?),
+      ));
+    }
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text("Inspection Persisted to Local Database!"), backgroundColor: Colors.green),
+    );
+
+    // Auto-send to the paired PC in the background -- deliberately NOT
+    // awaited. This inspection is already saved to the local database and
+    // flagged unsynced, so a slow or failed upload cannot lose it: the
+    // scan screen's unsynced badge shows how many are still pending, and
+    // they go up on the next send (automatic or via the Send button).
+    //
+    // Awaiting it used to hold this screen open for as long as the whole
+    // upload took before the inspector could get back to scanning -- and
+    // that is not a quick step: it zips every unsynced inspection *and
+    // its photos*, waits on mDNS discovery, then uploads with a 60s
+    // timeout. On a weak WiFi link that is easily tens of seconds of
+    // staring at the submit screen, per vehicle, which is exactly the
+    // "submit doesn't go to the next scan" delay.
+    unawaited(SyncService.instance.autoSendIfPaired());
+
+    // Build task list for printing
+    final printTasks = List.generate(_tasks.length, (i) {
+      final result = _taskResults[i] ?? {};
+      return {
+        'taskName': _tasks[i]['name'] as String? ?? 'Task',
+        'success': result['success'] as bool? ?? false,
+        'detectedPart': result['className'] as String?,
+      };
+    });
+
+    // Auto-print to the user's chosen default printer (NOT just the first
+    // paired device — that could be a laptop/phone, not the Zebra printer).
+    final overallOk =
+        _taskResults.values.every((r) => r['success'] == true);
+    final timestampNow = DateTime.now().toIso8601String();
+
+    DiscoveredPrinter? defaultPrinter;
+    try {
+      defaultPrinter = await PrintService.instance.getDefaultPrinter();
+    } catch (_) {
+      defaultPrinter = null;
+    }
+    if (!mounted) return;
+
+    if (defaultPrinter == null) {
+      // No printer chosen yet. Used to force every single submit through
+      // the printer picker until one was chosen -- fine once, but with no
+      // printer on hand (or one the operator doesn't want yet) it turned
+      // every scan into a detour through a page about Bluetooth pairing.
+      // Ask once (a small dialog, not a full-page navigation), remember
+      // the answer, and never interrupt again -- the print icon on the
+      // scan screen still opens the picker any time it's wanted later.
+      final alreadyPrompted = await PrintService.instance.hasPromptedPrinterSetup();
+      if (!mounted) return;
+      if (!alreadyPrompted) {
+        await PrintService.instance.markPrinterSetupPrompted();
+        final setUpNow = await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text("No printer connected"),
+            content: const Text(
+              "You can set up a Zebra printer now, or skip this and do it "
+              "later from the print icon on the scan screen. This won't "
+              "ask again either way.",
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(context, false), child: const Text("Skip for now")),
+              ElevatedButton(onPressed: () => Navigator.pop(context, true), child: const Text("Set Up Printer")),
+            ],
+          ),
+        );
+        if (!mounted) return;
+        if (setUpNow == true) {
+          await Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => PrinterDiscoveryScreen(
+                vin: widget.vin ?? 'UNKNOWN',
+                modelCode: widget.modelCode ?? 'UNKNOWN',
+                timestamp: timestampNow,
+                overallSuccess: overallOk,
+                tasks: printTasks,
+              ),
+            ),
+          );
+        }
+      }
+      // Otherwise (already asked before, or just skipped) -- fall straight
+      // through to the next scan below, same as a successful print would.
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text("Printing to ${defaultPrinter.name}..."),
+          backgroundColor: Colors.blue,
+          duration: const Duration(seconds: 2),
+        ),
+      );
+      // NOT awaited -- same reasoning as the PC auto-send above. The
+      // Bluetooth connect is bounded at 8s, but that is still a full 8+
+      // second stall on this screen per vehicle if the printer is off/out
+      // of range, which is exactly the "stuck on submit" complaint. The
+      // inspection is already saved locally, and a failed/skipped print can
+      // always be redone from History's reprint button, so nothing is lost
+      // by moving on to the next scan immediately instead of waiting here.
+      unawaited(_printInBackground(
+        printer: defaultPrinter,
+        vin: widget.vin ?? 'UNKNOWN',
+        modelCode: widget.modelCode ?? 'UNKNOWN',
+        timestamp: timestampNow,
+        overallSuccess: overallOk,
+        tasks: printTasks,
+      ));
+    }
+
+    // Every few submissions made while off the configured shop WiFi, ask
+    // the inspector to reconnect -- catches the case where auto-connect at
+    // startup (see main.dart) didn't work or the connection has since
+    // dropped. Awaited (unlike sync/print above) since this is a rare,
+    // deliberately interruptive nudge, not something on the hot path of
+    // every submit.
+    if (await WifiService.instance.registerSubmissionAndShouldNag()) {
+      final allowed = await WifiService.instance.getAllowedWifi();
+      if (mounted && allowed != null) await _showWifiReminderDialog(allowed.ssid);
+    }
+
+    if (mounted) Navigator.pop(context);
+  }
+
+  /// Only ever called after [WifiService.registerSubmissionAndShouldNag]
+  /// returns true, which itself only happens once a WiFi network has been
+  /// configured (see WifiService.getAllowedWifi) -- so [allowedSsid] here
+  /// is always the real configured SSID, never "nothing set up yet".
+  Future<void> _showWifiReminderDialog(String allowedSsid) async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Please connect to WiFi'),
+        content: Text(
+          'This phone isn\'t connected to "$allowedSsid", so inspection data can\'t reach the PC. '
+          'Please reconnect for data transmission to keep working.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Later')),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              WifiService.instance.openWifiSettings();
+            },
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFDC143C), foregroundColor: Colors.white),
+            child: const Text('Connect'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Runs the actual print after [_submitInspection] has already moved on
+  /// (see the call site) -- this screen may be disposed before it finishes,
+  /// so it must not touch [context]/ScaffoldMessenger, only the singleton
+  /// PrintService and its own captured, non-widget arguments.
+  Future<void> _printInBackground({
+    required DiscoveredPrinter printer,
+    required String vin,
+    required String modelCode,
+    required String timestamp,
+    required bool overallSuccess,
+    required List<Map<String, dynamic>> tasks,
+  }) async {
+    try {
+      final printSuccess = await PrintService.instance.printInspectionReport(
+        printer: printer,
+        vin: vin,
+        modelCode: modelCode,
+        timestamp: timestamp,
+        overallSuccess: overallSuccess,
+        tasks: tasks,
+      );
+      if (!printSuccess) {
+        debugPrint('Background print for $vin failed: ${PrintService.instance.lastPrintError}');
+      }
+    } catch (e) {
+      debugPrint('Background print for $vin threw: $e');
+    }
+  }
+
+  Widget _buildSubmitConfirmDialog() {
+    final bool allOk = _taskResults.values.every((r) => r['success'] == true);
+    final int failCount = _taskResults.values.where((r) => r['success'] != true).length;
+
+    return Dialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Title row
+            Row(
+              children: [
+                Icon(
+                  allOk ? Icons.check_circle_outline : Icons.warning_amber_rounded,
+                  color: allOk ? Colors.green : Colors.orange,
+                  size: 26,
+                ),
+                const SizedBox(width: 10),
+                const Text(
+                  'Submit Inspection',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            const Divider(),
+            const SizedBox(height: 8),
+
+            // Only show NOT OK tasks so inspector can decide to retake
+            Flexible(
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: List.generate(_tasks.length, (i) {
+                    final ok = _taskResults[i]?['success'] == true;
+                    if (ok) return const SizedBox.shrink();
+                    return Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 5),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.cancel, color: Colors.red, size: 20),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Text(
+                              _tasks[i]['name'],
+                              style: TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.w500,
+                                color: Colors.red[700],
+                              ),
+                            ),
+                          ),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                            decoration: BoxDecoration(
+                              color: Colors.red.withOpacity(0.12),
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            child: Text(
+                              _resultLabel(i),
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.red[700],
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  }),
+                ),
+              ),
+            ),
+
+            const SizedBox(height: 12),
+            const Divider(),
+            const SizedBox(height: 10),
+
+            // Summary message
+            Text(
+              allOk
+                  ? 'All targets found. Are you sure you want to submit?'
+                  : '$failCount task${failCount > 1 ? 's' : ''} did not find the target. Are you sure you want to submit anyway?',
+              style: TextStyle(
+                fontSize: 13,
+                color: allOk ? Colors.black54 : Colors.orange[800],
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+
+            const SizedBox(height: 20),
+
+            // Action buttons
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: () => Navigator.pop(context, false),
+                    style: OutlinedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      side: const BorderSide(color: Color(0xFFDC143C)),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    ),
+                    child: const Text(
+                      'CANCEL',
+                      style: TextStyle(color: Color(0xFFDC143C), fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: ElevatedButton(
+                    onPressed: () => Navigator.pop(context, true),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFFDC143C),
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    ),
+                    child: const Text(
+                      'SUBMIT',
+                      style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFFFFF5F5),
+      body: Column(
+        children: [
+          // Top Header
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+            decoration: const BoxDecoration(color: Color(0xFFDC143C)),
+            child: SafeArea(
+              bottom: false,
+              child: Row(
+                children: [
+                  IconButton(
+                    icon: const Icon(Icons.arrow_back, color: Colors.white),
+                    onPressed: () => Navigator.pop(context),
+                  ),
+                  const Spacer(),
+                  const Text(
+                    'INSPECTION',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 1.5,
+                    ),
+                  ),
+                  const Spacer(),
+                  IconButton(
+                    icon: const Icon(Icons.videocam_outlined, color: Colors.white),
+                    tooltip: 'Live Scan (Beta)',
+                    onPressed: () async {
+                      final result = await Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) => LiveInspectionCameraScreen(
+                            vin: widget.vin ?? "MANUAL_SCAN",
+                            modelCode: widget.modelCode ?? "",
+                            tasks: _tasks,
+                            initialIndex: 0,
+                          ),
+                        ),
+                      );
+                      if (result != null && result is Map<int, dynamic>) {
+                        setState(() => _taskResults.addAll(result));
+                      }
+                    },
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          // Vehicle Info Bar
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.9),
+              border: const Border(
+                top: BorderSide(color: Color(0xFFD4AF37), width: 1),
+                bottom: BorderSide(color: Color(0xFFD4AF37), width: 1),
+              ),
+            ),
+            child: Column(
+              children: [
+                Text(
+                  '{% if scan_type == "engine" %}Engine No{% else %}VIN{% endif %}: ${widget.vin ?? "N/A"}',
+                  style: const TextStyle(
+                    color: Color(0xFFDC143C),
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Model Code: ${widget.modelCode ?? "N/A"}',
+                  style: const TextStyle(
+                    color: Colors.black87,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          // Task List
+          Expanded(
+            child: _loading 
+              ? const Center(child: CircularProgressIndicator(color: Color(0xFFDC143C)))
+              : ListView.builder(
+                  padding: const EdgeInsets.all(16),
+                  itemCount: _tasks.length,
+                  itemBuilder: (context, index) {
+                    final task = _tasks[index];
+                    final bool isDone = _taskResults.containsKey(index);
+                    
+                    return Container(
+                      margin: const EdgeInsets.only(bottom: 12),
+                      child: ElevatedButton(
+                        onPressed: () async {
+                          // Retake: only this single task. First time: full chain from this index.
+                          await _runTasks(index, single: _taskResults.containsKey(index));
+                        },
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.white,
+                          foregroundColor: const Color(0xFFDC143C),
+                          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(8),
+                            side: BorderSide(
+                              color: !isDone
+                                  ? const Color(0xFFD4AF37)
+                                  : (_taskResults[index]?['success'] == true ? Colors.green : Colors.red),
+                              width: isDone ? 2 : 1,
+                            ),
+                          ),
+                          elevation: 0,
+                        ),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Expanded(
+                              child: Text(
+                                task['name'],
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w500,
+                                  color: !isDone
+                                      ? const Color(0xFFDC143C)
+                                      : (_taskResults[index]?['success'] == true
+                                          ? Colors.green[700]
+                                          : Colors.red[700]),
+                                ),
+                              ),
+                            ),
+                            if (task['reference_image'] != null)
+                              GestureDetector(
+                                onTap: () => _showReferenceImage(context, task['reference_image']),
+                                child: Container(
+                                  margin: const EdgeInsets.only(right: 8),
+                                  padding: const EdgeInsets.all(4),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFFD4AF37).withOpacity(0.15),
+                                    shape: BoxShape.circle,
+                                  ),
+                                  child: const Icon(Icons.remove_red_eye_outlined, size: 18, color: Color(0xFFD4AF37)),
+                                ),
+                              ),
+                            if (_isLive(index))
+                              const Padding(
+                                padding: EdgeInsets.only(right: 8),
+                                child: Icon(Icons.videocam, size: 18, color: Color(0xFFDC143C)),
+                              ),
+                            if (isDone)
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                decoration: BoxDecoration(
+                                  color: Colors.white,
+                                  border: Border.all(
+                                    color: _taskResults[index]?['success'] == true ? Colors.green : Colors.red,
+                                    width: 2,
+                                  ),
+                                  borderRadius: BorderRadius.circular(20),
+                                ),
+                                child: Text(
+                                  _resultLabel(index),
+                                  style: TextStyle(
+                                    color: _taskResults[index]?['success'] == true ? Colors.green : Colors.red,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                              )
+                            else
+                              Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: const [
+                                  Icon(Icons.camera_alt, size: 18, color: Color(0xFFDC143C)),
+                                  SizedBox(height: 2),
+                                  Text('PENDING', style: TextStyle(color: Colors.orange, fontWeight: FontWeight.bold, fontSize: 9)),
+                                ],
+                              ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+          ),
+          
+          // Submit Button
+          if (_tasks.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.all(24),
+              child: SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: _submitting ? null : _submitInspection,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFFDC143C),
+                    foregroundColor: Colors.white,
+                    disabledBackgroundColor: Colors.grey.shade400,
+                    disabledForegroundColor: Colors.white70,
+                    padding: const EdgeInsets.symmetric(vertical: 18),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    elevation: 4,
+                  ),
+                  child: _submitting
+                      ? const SizedBox(
+                          height: 22,
+                          width: 22,
+                          child: CircularProgressIndicator(strokeWidth: 2.4, color: Colors.white),
+                        )
+                      : const Text('SUBMIT INSPECTION', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, letterSpacing: 1.2)),
+                ),
+              ),
+            ),
+        ],
+      ),
+      bottomNavigationBar: _buildBottomNav(),
+    );
+  }
+
+  Widget _buildBottomNav() {
+    return Container(
+      height: 80,
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: const BorderRadius.only(topLeft: Radius.circular(20), topRight: Radius.circular(20)),
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.1), blurRadius: 10, offset: const Offset(0, -2))],
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceAround,
+        children: [
+          _navItem(Icons.home, "Home", true),
+          _navItem(Icons.history, "History", false, onTap: () {
+            Navigator.push(context, MaterialPageRoute(builder: (_) => const HistoryScreen()));
+          }),
+          _navItem(Icons.sync, "Send to PC", false, onTap: () {
+            Navigator.push(context, MaterialPageRoute(builder: (_) => const SyncScreen()));
+          }),
+          _navItem(Icons.bug_report, "Last scan log", false, onTap: () {
+            showLastScanLog(context);
+          }),
+        ],
+      ),
+    );
+  }
+
+  Widget _navItem(IconData icon, String label, bool active, {VoidCallback? onTap}) {
+    final color = active ? const Color(0xFFDC143C) : Colors.grey;
+    return InkWell(
+      onTap: onTap,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, color: color),
+          Text(label, style: TextStyle(color: color, fontSize: 12)),
+        ],
+      ),
+    );
+  }
+}

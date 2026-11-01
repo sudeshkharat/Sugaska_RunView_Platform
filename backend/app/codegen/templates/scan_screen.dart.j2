@@ -1,0 +1,1188 @@
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
+import '../services/torch_session.dart';
+import 'package:camera/camera.dart';
+{% if unmapped_code_auto_submit %}
+import 'package:drift/drift.dart' as drift;
+{% endif %}
+import 'home_screen.dart';
+import 'history_screen.dart';
+import 'printer_discovery_screen.dart';
+import 'sync_screen.dart';
+import 'settings_screen.dart';
+import '../services/sync_service.dart';
+import '../database/database.dart';
+{% if is_ocr_app %}
+import 'ocr_scan_screen.dart';
+{% endif %}
+{% set SC = scan_screen_class_name | default('ScanScreen') %}
+
+// This template is normally rendered once as "ScanScreen". A "combined"
+// app (VIN scan + Chakan/engine scan + OCR all in one app) renders it
+// TWICE with different (scan_screen_class_name, scan_type) overrides --
+// once per barcode format -- since scan_type/is_ocr_app drive Jinja
+// conditionals that decide which code exists at all, not a runtime value;
+// two differently-named classes is how both formats coexist in one app
+// without changing a single line of behavior for existing single-format
+// apps (scan_screen_class_name defaults to plain "ScanScreen" for them,
+// identical output to before this existed).
+class {{ SC }} extends StatefulWidget {
+  final String modelCode;
+  // Only used by the OCR engine-code-truth flow, to hand real cameras on to
+  // OcrScanScreen after a successful barcode scan -- the VIN/model-code
+  // flow doesn't need this (it navigates to HomeScreen with cameras: []
+  // today, unrelated to this change).
+  final List<CameraDescription> cameras;
+  const {{ SC }}({super.key, required this.modelCode, this.cameras = const []});
+
+  @override
+  State<{{ SC }}> createState() => _{{ SC }}State();
+}
+
+class _{{ SC }}State extends State<{{ SC }}> with WidgetsBindingObserver {
+  bool _isProcessing = false;
+  List<dynamic> _scanData = [];
+  String? _pendingBarcode;
+  bool _manualMode = false;
+  int _unsyncedCount = 0;
+
+  // Last completed scan (any VIN/model code), shown as a small non-blocking
+  // hint so the operator can tell at a glance whether they already scanned
+  // this vehicle -- without interrupting the current scan flow.
+  Inspection? _lastInspection;
+  Timer? _lastScanTicker;
+
+  // Whether the user wants the flash to stay on -- once turned on it stays
+  // on across scans/mode switches (each of which briefly stops+starts the
+  // camera), instead of silently resetting off like a single-shot toggle.
+  bool _torchWanted = false;
+
+  // "Always on" mode, set via double-tap on the flash button. Unlike a
+  // single tap it survives scans, mode switches and a trip through another
+  // screen (e.g. Sync), staying on until the user explicitly turns it off
+  // (single tap, or double tap again) or leaves the app -- it is
+  // deliberately session-only (not persisted to disk), so it does NOT come
+  // back on its own the next time the app is opened.
+  bool _torchAlwaysOn = false;
+
+  final MobileScannerController _scannerController = MobileScannerController(
+    detectionSpeed: DetectionSpeed.noDuplicates,
+    facing: CameraFacing.back,
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    // "Always on" torch turned on from an inspection screen earlier in this app session.
+    if (TorchSession.alwaysOn) {
+      _torchAlwaysOn = true;
+      _torchWanted = true;
+      // The scanner camera starts on its own after the first build; give it a moment.
+      Future.delayed(const Duration(milliseconds: 900), () {
+        if (mounted) _reapplyTorchIfWanted();
+      });
+    }
+    _loadScanData();
+    _refreshUnsyncedBadge();
+    // The "X min ago" text on the last-scan hint needs to keep advancing
+    // even while nothing new is scanned, so tick it forward periodically
+    // rather than only recomputing it when a new scan comes in.
+    _lastScanTicker = Timer.periodic(const Duration(seconds: 20), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  Future<void> _refreshUnsyncedBadge() async {
+    final count = await SyncService.instance.getUnsyncedCount();
+    final last = await db.getMostRecentInspection();
+    if (mounted) setState(() {
+      _unsyncedCount = count;
+      _lastInspection = last;
+    });
+  }
+
+  /// Short "just now" / "3m ago" / "2h ago" label for the last-scan hint.
+  String _timeAgo(DateTime when) {
+    final diff = DateTime.now().difference(when);
+    if (diff.inSeconds < 60) return 'just now';
+    if (diff.inMinutes < 60) return '${diff.inMinutes} min ago';
+    if (diff.inHours < 24) return '${diff.inHours}h ago';
+    return '${diff.inDays}d ago';
+  }
+
+  /// Single tap: plain on/off for this session only. Turning it off this
+  /// way also cancels "always on" mode if it was active -- an explicit
+  /// tap-to-turn-off should stick.
+  Future<void> _toggleTorch() async {
+    await _scannerController.toggleTorch();
+    final isOn = _scannerController.torchState.value == TorchState.on;
+    _torchWanted = isOn;
+    if (!isOn && _torchAlwaysOn) {
+      _torchAlwaysOn = false;
+      TorchSession.alwaysOn = false;
+    }
+    if (mounted) setState(() {});
+  }
+
+  /// Double tap: toggles "always on" mode -- stays on until explicitly
+  /// turned off (single tap, or double tap again) or the app is exited.
+  Future<void> _toggleTorchAlwaysOn() async {
+    _torchAlwaysOn = !_torchAlwaysOn;
+    _torchWanted = _torchAlwaysOn;
+    TorchSession.alwaysOn = _torchAlwaysOn;   // shared with the inspection screens
+
+    final isOn = _scannerController.torchState.value == TorchState.on;
+    if (_torchAlwaysOn && !isOn) {
+      await _scannerController.toggleTorch();
+    } else if (!_torchAlwaysOn && isOn) {
+      await _scannerController.toggleTorch();
+    }
+    if (mounted) setState(() {});
+  }
+
+  /// Re-applies torch-on after a (re)start of the camera session if the user
+  /// wants it on. A fresh camera session always starts with the torch
+  /// physically off, but the controller's torchState listenable can briefly
+  /// keep reporting the pre-restart value -- checking it immediately after
+  /// start() can therefore wrongly conclude the torch is "already on" and
+  /// skip re-enabling it, leaving the light off while the UI still thinks
+  /// "always on" is active. The short delay lets that state settle first.
+  Future<void> _reapplyTorchIfWanted() async {
+    // The inspection screens share "always on": adopt a change made there.
+    if (TorchSession.alwaysOn != _torchAlwaysOn) {
+      _torchAlwaysOn = TorchSession.alwaysOn;
+      _torchWanted = _torchAlwaysOn;
+      if (mounted) setState(() {});
+    }
+    if (!_torchWanted) return;
+    // After stop()/start() (e.g. coming back from an inspection for the next VIN)
+    // the camera is physically dark but torchState can still say "on" -- so do
+    // not trust it. Wait for the camera to settle, force the listenable to the
+    // real (off) state, then switch the torch on and verify once.
+    await Future.delayed(const Duration(milliseconds: 600));
+    if (!mounted || !_torchWanted) return;
+    if (_scannerController.torchState.value == TorchState.on) {
+      try {
+        await _scannerController.toggleTorch();   // stale "on" -> off
+        await Future.delayed(const Duration(milliseconds: 150));
+      } catch (_) {}
+    }
+    for (int attempt = 0; attempt < 2; attempt++) {
+      if (!mounted || !_torchWanted) return;
+      if (_scannerController.torchState.value == TorchState.on) return;
+      try {
+        await _scannerController.toggleTorch();
+      } catch (_) {}
+      await Future.delayed(const Duration(milliseconds: 400));
+    }
+  }
+
+  /// Stops and restarts the camera session (used whenever we need to reset
+  /// scanner state, e.g. switching Auto/Manual mode, or handing the camera
+  /// back after another screen used it) while keeping the flash on if the
+  /// user had turned it on -- start() can otherwise silently drop torch.
+  Future<void> _restartScanner() async {
+    try {
+      await _scannerController.stop();
+    } catch (_) {}
+
+    // Give the OS camera HAL a moment to actually release the hardware --
+    // stop() can resolve before the native camera device is fully closed
+    // (especially right after another screen, e.g. the PC-pairing QR
+    // scanner, had its own controller on it), and starting again too soon
+    // throws or leaves a black/frozen preview that never recovers on its
+    // own, forcing a full app restart to get VIN scanning back.
+    await Future.delayed(const Duration(milliseconds: 300));
+    if (!mounted) return;
+
+    try {
+      await _scannerController.start();
+    } catch (e) {
+      debugPrint('Scanner restart failed, retrying: $e');
+      await Future.delayed(const Duration(milliseconds: 600));
+      if (!mounted) return;
+      try {
+        await _scannerController.start();
+      } catch (e2) {
+        debugPrint('Scanner restart retry failed: $e2');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Camera failed to restart. Tap here or reopen the app if scanning stays dead.'),
+              backgroundColor: Colors.orange,
+              duration: Duration(seconds: 4),
+            ),
+          );
+        }
+        return;
+      }
+    }
+    await _reapplyTorchIfWanted();
+  }
+
+  Future<void> _loadScanData() async {
+    try {
+{% if scan_type == 'engine' %}
+      final String jsonStr = await rootBundle.loadString('assets/engine_data.json');
+{% else %}
+      final String jsonStr = await rootBundle.loadString('assets/master_data.json');
+{% endif %}
+      final List<dynamic> data = json.decode(jsonStr);
+      if (mounted) {
+        setState(() => _scanData = data);
+      }
+    } catch (e) {
+      debugPrint('Could not load scan data: $e');
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _lastScanTicker?.cancel();
+    _scanErrorTimer?.cancel();
+    _scannerController.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      setState(() => _pendingBarcode = null);
+      _scannerController.start().then((_) => _reapplyTorchIfWanted());
+    } else if (state == AppLifecycleState.inactive) {
+      _scannerController.stop();
+    } else if (state == AppLifecycleState.paused || state == AppLifecycleState.detached) {
+      // The user has actually left the app (home button, app switcher, task
+      // kill) rather than a brief interruption -- "always on" torch should
+      // not silently resume the next time the app is opened, so cancel it
+      // here rather than leaving it to reassert itself on resume.
+      _torchAlwaysOn = false;
+      _torchWanted = false;
+      TorchSession.alwaysOn = false;
+    }
+  }
+
+{% if unmapped_code_auto_submit %}
+  /// Shown instead of [_showErrorDialog] when a scanned code matches no
+  /// configured task profile and unmapped codes are allowed to auto-pass --
+  /// e.g. a real variant that simply has nothing to inspect, not a typo'd
+  /// or unknown code. Not silently automatic: the operator still has to
+  /// tap Submit (or Cancel to rescan) so a genuinely wrong scan doesn't
+  /// get waved through unnoticed. Records an OK inspection with no task
+  /// and no photo, which syncs to the PC receiver exactly like any other
+  /// result.
+  void _showUnmappedCodeDialog(String vin, String code) {
+    _scannerController.stop();
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            const Expanded(
+              child: Text('No Inspection Required',
+                  style: TextStyle(color: Color(0xFFDC143C), fontWeight: FontWeight.bold)),
+            ),
+            IconButton(
+              icon: const Icon(Icons.close),
+              tooltip: 'Cancel',
+              onPressed: () {
+                Navigator.of(ctx).pop();
+                if (mounted) {
+                  setState(() {
+                    _isProcessing = false;
+                    _pendingBarcode = null;
+                  });
+                  _restartScanner();
+                }
+              },
+            ),
+          ],
+        ),
+        content: Text(
+          'Scanned code "$code" doesn\'t match any configured inspection task for this app.\n\n'
+          'If this variant genuinely has nothing to inspect, tap Submit to record it as OK with '
+          'no photo. If this was a misread, tap the X above and rescan.',
+        ),
+        actions: [
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF43A047)),
+            onPressed: () async {
+              final inspectionId = await db.saveInspection(InspectionsCompanion.insert(vin: vin, modelCode: code));
+              await db.saveTaskResult(TaskResultsCompanion.insert(
+                inspectionId: inspectionId,
+                taskName: 'no_task_mapped',
+                className: 'N/A',
+                confidence: 1.0,
+                success: true,
+                imagePath: const drift.Value(null),
+              ));
+              if (!ctx.mounted) return;
+              Navigator.of(ctx).pop();
+              if (!mounted) return;
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Submitted (OK) -- no inspection required'), backgroundColor: Color(0xFF43A047)),
+              );
+              setState(() {
+                _isProcessing = false;
+                _pendingBarcode = null;
+              });
+              await _restartScanner();
+              _refreshUnsyncedBadge();
+            },
+            child: const Text('Submit (OK)', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+  }
+{% endif %}
+
+  /// A wrong / unmapped code no longer pops a dialog (which stopped the
+  /// camera and made the operator tap OK before every retry). The scanner
+  /// keeps running and a banner over the preview names the problem; it
+  /// stays while the bad code is in view and clears itself shortly after
+  /// the camera moves away, so the operator just keeps aiming until the
+  /// right (mapped) code is read.
+  String? _scanError;
+  bool _scanErrorUnmapped = false;
+  Timer? _scanErrorTimer;
+
+  /// [unmapped] = the QR has the right pattern for this scan type but the
+  /// code has no task / master data (vs. a QR of the wrong kind altogether).
+  void _showErrorDialog(String message, {bool unmapped = false}) {
+    if (!mounted) return;
+    if (unmapped) {
+      // Right kind of QR but nothing mapped for it: this one is a real stop,
+      // so keep the blocking pop-up (the operator must acknowledge it).
+      _scanErrorTimer?.cancel();
+      _scannerController.stop();
+      setState(() {
+        _scanError = null;
+        _pendingBarcode = null;
+      });
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => AlertDialog(
+          title: const Text('{% if scan_type == 'engine' %}Engine not mapped{% elif scan_type == 'chakan' %}Chakan vehicle not mapped{% else %}VIN not mapped{% endif %}',
+              style: TextStyle(color: Color(0xFFDC143C), fontWeight: FontWeight.bold)),
+          content: Text('The QR is correct, but there is no task for it.\n\n$message'),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(ctx).pop();
+                if (mounted) {
+                  setState(() => _isProcessing = false);
+                  _restartScanner();
+                }
+              },
+              child: const Text('OK', style: TextStyle(color: Color(0xFFDC143C))),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+    setState(() {
+      _isProcessing = false;
+      _pendingBarcode = null;
+      _scanError = message;
+      _scanErrorUnmapped = unmapped;
+    });
+    _scanErrorTimer?.cancel();
+    _scanErrorTimer = Timer(const Duration(milliseconds: 2500), () {
+      if (mounted) setState(() => _scanError = null);
+    });
+  }
+
+{% if scan_type != 'engine' %}
+  // ── Model Code Lookup (shared by VIN and Chakan Plant scans) ───────────────
+
+  bool _isKnownModelCode(String candidate) {
+    if (candidate.isEmpty || _scanData.isEmpty) return false;
+    final upper = candidate.toUpperCase();
+    return _scanData.any(
+      (m) => (m['model_code'] as String? ?? '').toUpperCase() == upper,
+    );
+  }
+
+  String _resolveModelCode(String suffix) {
+    for (final strip in [2, 1, 0]) {
+      if (suffix.length > strip) {
+        final candidate = suffix.substring(0, suffix.length - strip);
+        if (_isKnownModelCode(candidate)) {
+          return candidate;
+        }
+      }
+    }
+    if (suffix.length > 2) return suffix.substring(0, suffix.length - 2);
+    return suffix;
+  }
+{% endif %}
+
+{% if scan_type == 'engine' %}
+  // ── Engine Code Scan Logic ────────────────────────────────────────────────
+
+  bool _isKnownEngineCode(String candidate) {
+    if (candidate.isEmpty || _scanData.isEmpty) return false;
+    final upper = candidate.toUpperCase();
+    return _scanData.any(
+      (m) => (m['part_no'] as String? ?? '').toUpperCase() == upper,
+    );
+  }
+
+  Future<void> _onDetect(BarcodeCapture capture) async {
+    if (_isProcessing) return;
+    final List<Barcode> barcodes = capture.barcodes;
+    if (barcodes.isEmpty) return;
+    final String? code = barcodes.first.rawValue;
+    if (code == null || code.trim().isEmpty) return;
+    final String raw = code.trim();
+
+    if (_manualMode) {
+      setState(() => _pendingBarcode = raw);
+      return;
+    }
+
+    // Auto mode
+    final int spaceIdx = raw.indexOf(' ');
+    String partNo;
+    String engineSerial;
+    if (spaceIdx != -1) {
+      partNo = raw.substring(0, spaceIdx).trim();
+      engineSerial = raw.substring(spaceIdx + 1).trim();
+      setState(() => _isProcessing = true);
+{% if not skip_masterdata_validation %}
+      if (!_isKnownEngineCode(partNo)) {
+{% if unmapped_code_auto_submit %}
+        _showUnmappedCodeDialog(engineSerial, partNo);
+{% else %}
+        _showErrorDialog('Engine code not found. Please add it and rebuild the app.', unmapped: true);
+{% endif %}
+        return;
+      }
+{% endif %}
+    } else {
+{% if is_ocr_app and ocr_expected_length %}
+      // Second sticker format: no separator -- the engine number is a
+      // fixed-length prefix. There's no part number in this format, so
+      // nothing to validate against engine_data.json; only the length
+      // gets checked.
+      if (raw.length < {{ ocr_expected_length }}) {
+        setState(() => _isProcessing = true);
+        _showErrorDialog('Invalid engine barcode. Expected "PART_NO SERIAL_NO", or a code at least {{ ocr_expected_length }} characters long.');
+        return;
+      }
+      partNo = '';
+      engineSerial = raw.substring(0, {{ ocr_expected_length }});
+      setState(() => _isProcessing = true);
+{% else %}
+      setState(() => _isProcessing = true);
+      _showErrorDialog('Invalid engine barcode. Expected format: PART_NO SERIAL_NO');
+      return;
+{% endif %}
+    }
+
+    if (!mounted) return;
+    // stop() can resolve before the camera HAL actually releases the
+    // hardware -- without a head start here, the next screen's own
+    // CameraController can start binding while this scanner's camera
+    // session is still tearing down, and CameraX throws "No supported
+    // surface combination is found for camera device" from two camera
+    // clients contending for the same device at once. Same race (and same
+    // fix) as the Sync/Pair-PC navigation elsewhere in this file.
+    await _scannerController.stop();
+    await Future.delayed(const Duration(milliseconds: 300));
+    if (!mounted) return;
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (context) => {% if is_ocr_app %}OcrScanScreen(cameras: widget.cameras, truthValue: engineSerial){% else %}HomeScreen(
+          vin: engineSerial,
+          modelCode: {% if skip_masterdata_validation %}''{% else %}partNo{% endif %},
+          cameras: [],
+        ){% endif %},
+      ),
+    ).then((_) async {
+      if (mounted) {
+        await _restartScanner();
+        setState(() {
+          _isProcessing = false;
+          _pendingBarcode = null;
+        });
+        _refreshUnsyncedBadge();
+      }
+    });
+  }
+
+  Future<void> _processScan() async {
+    final raw = _pendingBarcode;
+    if (raw == null || _isProcessing) return;
+
+    final int spaceIdx = raw.indexOf(' ');
+    String partNo;
+    String engineSerial;
+    if (spaceIdx != -1) {
+      partNo = raw.substring(0, spaceIdx).trim();
+      engineSerial = raw.substring(spaceIdx + 1).trim();
+      setState(() => _isProcessing = true);
+{% if not skip_masterdata_validation %}
+      if (!_isKnownEngineCode(partNo)) {
+{% if unmapped_code_auto_submit %}
+        _showUnmappedCodeDialog(engineSerial, partNo);
+{% else %}
+        _showErrorDialog('Engine code not found. Please add it and rebuild the app.', unmapped: true);
+{% endif %}
+        return;
+      }
+{% endif %}
+    } else {
+{% if is_ocr_app and ocr_expected_length %}
+      if (raw.length < {{ ocr_expected_length }}) {
+        setState(() => _isProcessing = true);
+        _showErrorDialog('Invalid engine barcode. Expected "PART_NO SERIAL_NO", or a code at least {{ ocr_expected_length }} characters long.');
+        return;
+      }
+      partNo = '';
+      engineSerial = raw.substring(0, {{ ocr_expected_length }});
+      setState(() => _isProcessing = true);
+{% else %}
+      setState(() => _isProcessing = true);
+      _showErrorDialog('Invalid engine barcode. Expected format: PART_NO SERIAL_NO');
+      return;
+{% endif %}
+    }
+
+    if (!mounted) return;
+    // stop() can resolve before the camera HAL actually releases the
+    // hardware -- without a head start here, the next screen's own
+    // CameraController can start binding while this scanner's camera
+    // session is still tearing down, and CameraX throws "No supported
+    // surface combination is found for camera device" from two camera
+    // clients contending for the same device at once. Same race (and same
+    // fix) as the Sync/Pair-PC navigation elsewhere in this file.
+    await _scannerController.stop();
+    await Future.delayed(const Duration(milliseconds: 300));
+    if (!mounted) return;
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (context) => {% if is_ocr_app %}OcrScanScreen(cameras: widget.cameras, truthValue: engineSerial){% else %}HomeScreen(
+          vin: engineSerial,
+          modelCode: {% if skip_masterdata_validation %}''{% else %}partNo{% endif %},
+          cameras: [],
+        ){% endif %},
+      ),
+    ).then((_) async {
+      if (mounted) {
+        await _restartScanner();
+        setState(() {
+          _isProcessing = false;
+          _pendingBarcode = null;
+        });
+        _refreshUnsyncedBadge();
+      }
+    });
+  }
+
+{% elif scan_type == 'chakan' %}
+  // ── Chakan Plant Scan Logic ───────────────────────────────────────────────
+  // Barcode format: VIN_MODELCODE_GARBAGE (underscore-delimited).
+  // Model code segment may carry 2 trailing junk characters, resolved via the
+  // shared _resolveModelCode() above (same stripping rule as the VIN flow).
+
+  Future<void> _handleChakanScan(String raw) async {
+    final List<String> parts = raw.split('_');
+    if (parts.length < 2 || parts[0].trim().isEmpty || parts[1].trim().isEmpty) {
+      setState(() => _isProcessing = true);
+      _showErrorDialog('Invalid Chakan Plant barcode. Expected format: VIN_MODELCODE_GARBAGE');
+      return;
+    }
+
+    setState(() => _isProcessing = true);
+
+    final String vin = parts[0].trim();
+    final String extractedModelCode = _resolveModelCode(parts[1].trim());
+
+{% if not skip_masterdata_validation %}
+    if (!_isKnownModelCode(extractedModelCode)) {
+{% if unmapped_code_auto_submit %}
+      _showUnmappedCodeDialog(vin, extractedModelCode);
+{% else %}
+      _showErrorDialog('Model code is not present, please add code and rebuild app.', unmapped: true);
+{% endif %}
+      return;
+    }
+{% endif %}
+
+    if (!mounted) return;
+    // stop() can resolve before the camera HAL actually releases the
+    // hardware -- without a head start here, the next screen's own
+    // CameraController can start binding while this scanner's camera
+    // session is still tearing down, and CameraX throws "No supported
+    // surface combination is found for camera device" from two camera
+    // clients contending for the same device at once. Same race (and same
+    // fix) as the Sync/Pair-PC navigation elsewhere in this file.
+    await _scannerController.stop();
+    await Future.delayed(const Duration(milliseconds: 300));
+    if (!mounted) return;
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (context) => {% if is_ocr_app %}OcrScanScreen(cameras: widget.cameras, truthValue: vin){% else %}HomeScreen(
+          vin: vin,
+          modelCode: {% if skip_masterdata_validation %}''{% else %}extractedModelCode{% endif %},
+          cameras: [],
+        ){% endif %},
+      ),
+    ).then((_) async {
+      if (mounted) {
+        await _restartScanner();
+        setState(() {
+          _isProcessing = false;
+          _pendingBarcode = null;
+        });
+        _refreshUnsyncedBadge();
+      }
+    });
+  }
+
+  Future<void> _onDetect(BarcodeCapture capture) async {
+    if (_isProcessing) return;
+    final List<Barcode> barcodes = capture.barcodes;
+    if (barcodes.isEmpty) return;
+    final String? code = barcodes.first.rawValue;
+    if (code == null || code.trim().isEmpty) return;
+    final String raw = code.trim();
+
+    if (_manualMode) {
+      setState(() => _pendingBarcode = raw);
+      return;
+    }
+
+    _handleChakanScan(raw);
+  }
+
+  Future<void> _processScan() async {
+    final raw = _pendingBarcode;
+    if (raw == null || _isProcessing) return;
+    _handleChakanScan(raw);
+  }
+
+{% else %}
+  // ── Model Code Scan Logic ─────────────────────────────────────────────────
+
+  Future<void> _onDetect(BarcodeCapture capture) async {
+    if (_isProcessing) return;
+    final List<Barcode> barcodes = capture.barcodes;
+    if (barcodes.isEmpty) return;
+    final String? code = barcodes.first.rawValue;
+    if (code == null || code.trim().isEmpty) return;
+    final String raw = code.trim();
+
+    if (_manualMode) {
+      setState(() => _pendingBarcode = raw);
+      return;
+    }
+
+    // Auto mode
+    if (raw.length < 30 || raw.length > 35) {
+      setState(() => _isProcessing = true);
+      _showErrorDialog('Please scan the right VIN model code.');
+      return;
+    }
+
+    setState(() => _isProcessing = true);
+
+    final String vin = raw.substring(0, 17);
+    final String suffix = raw.substring(17);
+    final String extractedModelCode = _resolveModelCode(suffix);
+
+{% if not skip_masterdata_validation %}
+    if (!_isKnownModelCode(extractedModelCode)) {
+{% if unmapped_code_auto_submit %}
+      _showUnmappedCodeDialog(vin, extractedModelCode);
+{% else %}
+      _showErrorDialog('Model code is not present, please add code and rebuild app.', unmapped: true);
+{% endif %}
+      return;
+    }
+{% endif %}
+
+    if (!mounted) return;
+    // stop() can resolve before the camera HAL actually releases the
+    // hardware -- without a head start here, the next screen's own
+    // CameraController can start binding while this scanner's camera
+    // session is still tearing down, and CameraX throws "No supported
+    // surface combination is found for camera device" from two camera
+    // clients contending for the same device at once. Same race (and same
+    // fix) as the Sync/Pair-PC navigation elsewhere in this file.
+    await _scannerController.stop();
+    await Future.delayed(const Duration(milliseconds: 300));
+    if (!mounted) return;
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (context) => {% if is_ocr_app %}OcrScanScreen(cameras: widget.cameras, truthValue: vin){% else %}HomeScreen(
+          vin: vin,
+          modelCode: {% if skip_masterdata_validation %}''{% else %}extractedModelCode{% endif %},
+          cameras: [],
+        ){% endif %},
+      ),
+    ).then((_) async {
+      if (mounted) {
+        await _restartScanner();
+        setState(() {
+          _isProcessing = false;
+          _pendingBarcode = null;
+        });
+        _refreshUnsyncedBadge();
+      }
+    });
+  }
+
+  Future<void> _processScan() async {
+    final raw = _pendingBarcode;
+    if (raw == null || _isProcessing) return;
+
+    if (raw.length < 30 || raw.length > 35) {
+      setState(() => _isProcessing = true);
+      _showErrorDialog('Please scan the right VIN model code.');
+      return;
+    }
+
+    setState(() => _isProcessing = true);
+
+    final String vin = raw.substring(0, 17);
+    final String suffix = raw.substring(17);
+    final String extractedModelCode = _resolveModelCode(suffix);
+
+{% if not skip_masterdata_validation %}
+    if (!_isKnownModelCode(extractedModelCode)) {
+{% if unmapped_code_auto_submit %}
+      _showUnmappedCodeDialog(vin, extractedModelCode);
+{% else %}
+      _showErrorDialog('Model code is not present, please add code and rebuild app.', unmapped: true);
+{% endif %}
+      return;
+    }
+{% endif %}
+
+    if (!mounted) return;
+    // stop() can resolve before the camera HAL actually releases the
+    // hardware -- without a head start here, the next screen's own
+    // CameraController can start binding while this scanner's camera
+    // session is still tearing down, and CameraX throws "No supported
+    // surface combination is found for camera device" from two camera
+    // clients contending for the same device at once. Same race (and same
+    // fix) as the Sync/Pair-PC navigation elsewhere in this file.
+    await _scannerController.stop();
+    await Future.delayed(const Duration(milliseconds: 300));
+    if (!mounted) return;
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (context) => {% if is_ocr_app %}OcrScanScreen(cameras: widget.cameras, truthValue: vin){% else %}HomeScreen(
+          vin: vin,
+          modelCode: {% if skip_masterdata_validation %}''{% else %}extractedModelCode{% endif %},
+          cameras: [],
+        ){% endif %},
+      ),
+    ).then((_) async {
+      if (mounted) {
+        await _restartScanner();
+        setState(() {
+          _isProcessing = false;
+          _pendingBarcode = null;
+        });
+        _refreshUnsyncedBadge();
+      }
+    });
+  }
+
+{% endif %}
+
+  @override
+  Widget build(BuildContext context) {
+    final bool barcodeReady = _pendingBarcode != null && !_isProcessing;
+    final Color frameColor = (_manualMode && barcodeReady)
+        ? Colors.green
+        : const Color(0xFFDC143C);
+
+    return Scaffold(
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [Colors.white, Color(0xFFFFF5F5)],
+          ),
+        ),
+        child: Column(
+          children: [
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 16),
+              decoration: const BoxDecoration(color: Color(0xFFDC143C)),
+              child: SafeArea(
+                bottom: false,
+                child: Row(
+                  children: [
+                    const Expanded(
+                      child: Text(
+                        'SCAN BARCODE',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 1.5,
+                        ),
+                      ),
+                    ),
+                    GestureDetector(
+                      onTap: () {
+                        setState(() => _pendingBarcode = null);
+                        Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                                builder: (_) => const PrinterDiscoveryScreen(
+                                    selectOnly: true)));
+                      },
+                      child: const Padding(
+                        padding: EdgeInsets.only(right: 16),
+                        child: Icon(Icons.print, color: Colors.white, size: 26),
+                      ),
+                    ),
+                    GestureDetector(
+                      onTap: () {
+                        setState(() => _pendingBarcode = null);
+                        Navigator.push(context, MaterialPageRoute(builder: (_) => const HistoryScreen()));
+                      },
+                      child: const Icon(Icons.history, color: Colors.white, size: 26),
+                    ),
+                    GestureDetector(
+                      onTap: () async {
+                        setState(() => _pendingBarcode = null);
+                        // Stop this screen's camera before handing off to the
+                        // Sync screen -- it may open its own camera session
+                        // (QR pairing scan), and two MobileScannerController
+                        // instances fighting over the same camera hardware at
+                        // once is what breaks VIN scanning until app restart.
+                        await _scannerController.stop();
+                        // stop() can resolve before the OS camera HAL has
+                        // actually released the hardware. If the user is
+                        // quick to tap through to "Pair New PC (Scan QR)"
+                        // right after this, its own camera can open while
+                        // this one is still tearing down, showing up as a
+                        // black preview that needs a manual back-and-retry
+                        // to clear. Giving the release a head start here
+                        // (on top of the QR scanner's own start delay)
+                        // makes that race much less likely to be hit at all.
+                        await Future.delayed(const Duration(milliseconds: 300));
+                        await Navigator.push(context, MaterialPageRoute(builder: (_) => const SettingsScreen()));
+                        if (mounted) {
+                          await _restartScanner();
+                        }
+                        _refreshUnsyncedBadge();
+                      },
+                      child: Padding(
+                        padding: const EdgeInsets.only(left: 16),
+                        child: Stack(
+                          clipBehavior: Clip.none,
+                          children: [
+                            const Icon(Icons.settings, color: Colors.white, size: 26),
+                            if (_unsyncedCount > 0)
+                              Positioned(
+                                right: -4,
+                                top: -4,
+                                child: Container(
+                                  padding: const EdgeInsets.all(2),
+                                  constraints: const BoxConstraints(minWidth: 15, minHeight: 15),
+                                  decoration: const BoxDecoration(
+                                    color: Colors.orangeAccent,
+                                    shape: BoxShape.circle,
+                                  ),
+                                  child: Text(
+                                    _unsyncedCount > 9 ? '9+' : '$_unsyncedCount',
+                                    textAlign: TextAlign.center,
+                                    style: const TextStyle(fontSize: 9, color: Colors.white, fontWeight: FontWeight.bold),
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            // Auto / Manual mode toggle
+            Container(
+              color: Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    _manualMode ? 'Manual Scan' : 'Auto Scan',
+                    style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
+                  ),
+                  Row(
+                    children: [
+                      Text(
+                        'Auto',
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: !_manualMode ? const Color(0xFFDC143C) : Colors.grey,
+                          fontWeight: !_manualMode ? FontWeight.bold : FontWeight.normal,
+                        ),
+                      ),
+                      Switch(
+                        value: _manualMode,
+                        onChanged: (val) async {
+                          setState(() {
+                            _manualMode = val;
+                            _pendingBarcode = null;
+                          });
+                          // Restart scanner to reset noDuplicates dedup state
+                          await _restartScanner();
+                        },
+                        activeColor: const Color(0xFFDC143C),
+                      ),
+                      Text(
+                        'Manual',
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: _manualMode ? const Color(0xFFDC143C) : Colors.grey,
+                          fontWeight: _manualMode ? FontWeight.bold : FontWeight.normal,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            if (_lastInspection != null)
+              Container(
+                width: double.infinity,
+                color: const Color(0xFFFFF3CD),
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                child: Row(
+                  children: [
+                    const Icon(Icons.info_outline, size: 14, color: Color(0xFF8A6D3B)),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        'Last scan: ${_lastInspection!.vin} • ${_timeAgo(_lastInspection!.createdAt)}',
+                        style: const TextStyle(fontSize: 12, color: Color(0xFF8A6D3B), fontWeight: FontWeight.w600),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            Expanded(
+              child: Stack(
+                children: [
+                  MobileScanner(
+                    controller: _scannerController,
+                    onDetect: _onDetect,
+                  ),
+                  Positioned(
+                    top: 12,
+                    right: 12,
+                    child: ValueListenableBuilder<TorchState>(
+                      valueListenable: _scannerController.torchState,
+                      builder: (context, torchState, child) {
+                        final isOn = torchState == TorchState.on;
+                        return GestureDetector(
+                          onTap: _toggleTorch,
+                          onDoubleTap: _toggleTorchAlwaysOn,
+                          child: Stack(
+                            clipBehavior: Clip.none,
+                            children: [
+                              Container(
+                                padding: const EdgeInsets.all(10),
+                                decoration: BoxDecoration(
+                                  color: Colors.black54,
+                                  shape: BoxShape.circle,
+                                  border: _torchAlwaysOn
+                                      ? Border.all(color: Colors.amberAccent, width: 2)
+                                      : null,
+                                ),
+                                child: Icon(
+                                  isOn ? Icons.flash_on : Icons.flash_off,
+                                  color: isOn ? Colors.amberAccent : Colors.white,
+                                  size: 22,
+                                ),
+                              ),
+                              if (_torchAlwaysOn)
+                                Positioned(
+                                  bottom: -2,
+                                  right: -2,
+                                  child: Container(
+                                    padding: const EdgeInsets.all(2),
+                                    decoration: const BoxDecoration(
+                                      color: Colors.amberAccent,
+                                      shape: BoxShape.circle,
+                                    ),
+                                    child: const Icon(Icons.push_pin, size: 9, color: Colors.black87),
+                                  ),
+                                ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                  Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        AnimatedContainer(
+                          duration: const Duration(milliseconds: 300),
+                          width: 250,
+                          height: 250,
+                          decoration: BoxDecoration(
+                            border: Border.all(color: frameColor, width: 2),
+                          ),
+                          child: Stack(
+                            children: [
+                              _bracket(top: 0, left: 0, isTop: true, isLeft: true, color: frameColor),
+                              _bracket(top: 0, right: 0, isTop: true, isLeft: false, color: frameColor),
+                              _bracket(bottom: 0, left: 0, isTop: false, isLeft: true, color: frameColor),
+                              _bracket(bottom: 0, right: 0, isTop: false, isLeft: false, color: frameColor),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        if (_manualMode)
+                          AnimatedSwitcher(
+                            duration: const Duration(milliseconds: 250),
+                            child: barcodeReady
+                                ? Container(
+                                    key: const ValueKey('detected'),
+                                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                                    decoration: BoxDecoration(
+                                      color: Colors.green.withOpacity(0.85),
+                                      borderRadius: BorderRadius.circular(6),
+                                    ),
+                                    child: const Text(
+                                      'Barcode detected — tap SCAN to confirm',
+                                      style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600, fontSize: 13),
+                                    ),
+                                  )
+                                : Container(
+                                    key: const ValueKey('waiting'),
+                                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                                    decoration: BoxDecoration(
+                                      color: Colors.black54,
+                                      borderRadius: BorderRadius.circular(6),
+                                    ),
+                                    child: const Text(
+                                      'Aim at barcode to detect',
+                                      style: TextStyle(color: Colors.white70, fontSize: 13),
+                                    ),
+                                  ),
+                          )
+                        else
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                            decoration: BoxDecoration(
+                              color: Colors.black54,
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            child: const Text(
+                              'Point camera at barcode',
+                              style: TextStyle(color: Colors.white70, fontSize: 13),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                  if (_scanError != null)
+                    Positioned(
+                      left: 12,
+                      right: 12,
+                      bottom: 16,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                        decoration: BoxDecoration(color: _scanErrorUnmapped ? const Color(0xFFEF6C00) : const Color(0xFFDC143C), borderRadius: BorderRadius.circular(8)),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.error_outline, color: Colors.white),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                _scanErrorUnmapped
+                                    ? '{% if scan_type == 'engine' %}QR is right, but this engine is not mapped - no task for it{% elif scan_type == 'chakan' %}QR is right, but this Chakan vehicle is not mapped - no task for it{% else %}QR is right, but this VIN is not mapped - no task for it{% endif %}\n$_scanError'
+                                    : '{% if scan_type == 'engine' %}Wrong QR - this is not an engine QR{% elif scan_type == 'chakan' %}Wrong QR - this is not a Chakan plant QR{% else %}Wrong QR - this is not a VIN QR{% endif %}\n$_scanError',
+                                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  if (_isProcessing)
+                    Container(
+                      color: Colors.black.withOpacity(0.5),
+                      child: const Center(
+                        child: CircularProgressIndicator(color: Color(0xFFDC143C)),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            if (_manualMode)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(24, 12, 24, 24),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: barcodeReady ? _processScan : null,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: barcodeReady ? const Color(0xFFDC143C) : Colors.grey.shade400,
+                      foregroundColor: Colors.white,
+                      disabledBackgroundColor: Colors.grey.shade400,
+                      disabledForegroundColor: Colors.white70,
+                      padding: const EdgeInsets.symmetric(vertical: 16),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    ),
+                    child: const Text('SCAN', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16, letterSpacing: 1.2)),
+                  ),
+                ),
+              )
+            else
+              const SizedBox(height: 24),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _bracket({double? top, double? bottom, double? left, double? right, required bool isTop, required bool isLeft, required Color color}) {
+    return Positioned(
+      top: top,
+      bottom: bottom,
+      left: left,
+      right: right,
+      child: Container(
+        width: 30,
+        height: 30,
+        decoration: BoxDecoration(
+          border: Border(
+            top: isTop ? BorderSide(color: color, width: 3) : BorderSide.none,
+            bottom: !isTop ? BorderSide(color: color, width: 3) : BorderSide.none,
+            left: isLeft ? BorderSide(color: color, width: 3) : BorderSide.none,
+            right: !isLeft ? BorderSide(color: color, width: 3) : BorderSide.none,
+          ),
+        ),
+      ),
+    );
+  }
+}

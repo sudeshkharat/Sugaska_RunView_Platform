@@ -1,0 +1,200 @@
+import 'dart:io';
+import 'package:drift/drift.dart';
+import 'package:drift/native.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+import 'package:sqlite3_flutter_libs/sqlite3_flutter_libs.dart';
+
+part 'database.g.dart';
+
+class Inspections extends Table {
+  IntColumn get id => integer().autoIncrement()();
+  TextColumn get vin => text()();
+  TextColumn get modelCode => text()();
+  DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
+  BoolColumn get isSynced => boolean().withDefault(const Constant(false))();
+}
+
+class TaskResults extends Table {
+  IntColumn get id => integer().autoIncrement()();
+  IntColumn get inspectionId => integer().references(Inspections, #id, onDelete: KeyAction.cascade)();
+  TextColumn get taskName => text()();
+  TextColumn get className => text()();
+  RealColumn get confidence => real()();
+  BoolColumn get success => boolean()();
+  TextColumn get imagePath => text().nullable()();
+  TextColumn get backupImagePath => text().nullable()();
+  // Near-original-quality copy of a NOT OK capture, saved to the
+  // NegativeDataset folder tree for training-data collection -- null for
+  // OK results and whenever the extra save failed.
+  TextColumn get negativeImagePath => text().nullable()();
+  TextColumn get detectionsJson => text().nullable()();
+  DateTimeColumn get timestamp => dateTime().withDefault(currentDateAndTime)();
+}
+
+/// A backup-copy image tied to an already-synced task result -- returned by
+/// [AppDatabase.getSyncedBackupImages] so the sync service knows both which
+/// file on disk to delete and which DB row to clear the path from.
+class BackupImageRef {
+  final int taskResultId;
+  final String path;
+  const BackupImageRef({required this.taskResultId, required this.path});
+}
+
+@DriftDatabase(tables: [Inspections, TaskResults])
+class AppDatabase extends _$AppDatabase {
+  AppDatabase() : super(_openConnection());
+
+  @override
+  int get schemaVersion => 4;
+
+  @override
+  MigrationStrategy get migration {
+    return MigrationStrategy(
+      onUpgrade: (m, from, to) async {
+        if (from < 2) {
+          await m.addColumn(taskResults, taskResults.imagePath);
+          await m.addColumn(taskResults, taskResults.detectionsJson);
+        }
+        if (from < 3) {
+          await m.addColumn(taskResults, taskResults.backupImagePath);
+        }
+        if (from < 4) {
+          await m.addColumn(taskResults, taskResults.negativeImagePath);
+        }
+      },
+      beforeOpen: (details) async {
+        await customStatement('PRAGMA foreign_keys = ON');
+      },
+    );
+  }
+
+  static QueryExecutor _openConnection() {
+    return LazyDatabase(() async {
+      final dbFolder = await getApplicationSupportDirectory();
+      final file = File(p.join(dbFolder.path, 'inspection_database.sqlite'));
+      if (Platform.isAndroid) {
+        await applyWorkaroundToOpenSqlite3OnOldAndroidVersions();
+      }
+      return NativeDatabase.createInBackground(file);
+    });
+  }
+
+  // DAO methods
+  Future<int> saveInspection(InspectionsCompanion entry) => into(inspections).insert(entry);
+  Future saveTaskResult(TaskResultsCompanion entry) => into(taskResults).insert(entry);
+  
+  Future<List<Inspection>> getAllInspections() => (select(inspections)..orderBy([(t) => OrderingTerm.desc(t.createdAt)])).get();
+
+  Future<List<TaskResult>> getResultsForInspection(int inspectionId) =>
+    (select(taskResults)..where((t) => t.inspectionId.equals(inspectionId))).get();
+
+  // ── PC sync status ────────────────────────────────────────────────────
+  // [limit] caps how many unsynced rows come back at once -- with a large
+  // backlog (thousands of inspections, each with photos), building one
+  // export bundle for *all* of them at once produces a zip upload that's
+  // too big to fit the PC's 60s upload timeout (or the phone's memory), so
+  // the send silently fails every time and the backlog never shrinks.
+  // Sending expects to be called repeatedly in bounded batches instead.
+  Future<List<Inspection>> getUnsyncedInspections({int? limit}) {
+    final q = select(inspections)..where((t) => t.isSynced.equals(false));
+    q.orderBy([(t) => OrderingTerm.asc(t.createdAt)]);
+    if (limit != null) q.limit(limit);
+    return q.get();
+  }
+
+  Future<int> countUnsyncedInspections() async {
+    final count = countAll(filter: inspections.isSynced.equals(false));
+    final query = selectOnly(inspections)..addColumns([count]);
+    final row = await query.getSingle();
+    return row.read(count) ?? 0;
+  }
+
+  Future<void> markInspectionsSynced(List<int> ids) async {
+    if (ids.isEmpty) return;
+    await (update(inspections)..where((t) => t.id.isIn(ids)))
+        .write(const InspectionsCompanion(isSynced: Value(true)));
+  }
+
+  /// Marks every inspection unsynced again, so the next sync resends the
+  /// phone's entire local history rather than just what's currently
+  /// flagged new. Used as a manual "Resync All" safety net -- e.g. after
+  /// re-pairing with a PC, or if the sync state is ever in doubt -- to
+  /// force everything back up rather than trust the isSynced flag alone.
+  /// Safe to run repeatedly: the receiver deduplicates by VIN/date/time/
+  /// task, so re-sending something it already has doesn't create a
+  /// duplicate row there.
+  Future<void> resetAllSyncStatus() async {
+    await update(inspections).write(const InspectionsCompanion(isSynced: Value(false)));
+  }
+
+  // ── Backup-image cache housekeeping ─────────────────────────────────────
+  // The backup copy under app storage is only ever a fallback for the
+  // primary gallery copy; once its inspection is confirmed synced to the
+  // PC, the backup is expendable. Oldest-first so cache-clearing trims the
+  // stalest data first.
+  Future<List<BackupImageRef>> getSyncedBackupImages() async {
+    final query = select(taskResults).join([
+      innerJoin(inspections, inspections.id.equalsExp(taskResults.inspectionId)),
+    ])
+      ..where(inspections.isSynced.equals(true) & taskResults.backupImagePath.isNotNull())
+      ..orderBy([OrderingTerm.asc(taskResults.timestamp)]);
+    final rows = await query.get();
+    return rows
+        .map((row) => row.readTable(taskResults))
+        .where((tr) => tr.backupImagePath != null)
+        .map((tr) => BackupImageRef(taskResultId: tr.id, path: tr.backupImagePath!))
+        .toList();
+  }
+
+  Future<void> clearBackupImagePath(int taskResultId) async {
+    await (update(taskResults)..where((t) => t.id.equals(taskResultId)))
+        .write(const TaskResultsCompanion(backupImagePath: Value(null)));
+  }
+
+  // ── Negative-dataset image housekeeping ─────────────────────────────────
+  // The full-quality NOT OK copy only needs to live on the phone until the
+  // PC has it -- once synced, the PC's negative_dataset copy is the one
+  // that matters, so the on-device original is safe to delete to save
+  // storage instead of accumulating forever.
+  Future<List<BackupImageRef>> getSyncedNegativeImages() async {
+    final query = select(taskResults).join([
+      innerJoin(inspections, inspections.id.equalsExp(taskResults.inspectionId)),
+    ])
+      ..where(inspections.isSynced.equals(true) & taskResults.negativeImagePath.isNotNull())
+      ..orderBy([OrderingTerm.asc(taskResults.timestamp)]);
+    final rows = await query.get();
+    return rows
+        .map((row) => row.readTable(taskResults))
+        .where((tr) => tr.negativeImagePath != null)
+        .map((tr) => BackupImageRef(taskResultId: tr.id, path: tr.negativeImagePath!))
+        .toList();
+  }
+
+  Future<void> clearNegativeImagePath(int taskResultId) async {
+    await (update(taskResults)..where((t) => t.id.equals(taskResultId)))
+        .write(const TaskResultsCompanion(negativeImagePath: Value(null)));
+  }
+
+  // Most recent scan overall (any VIN/model code) -- used by the scan
+  // screen to show a "last scan was VIN... X min ago" hint without
+  // interrupting the next scan.
+  Future<Inspection?> getMostRecentInspection() =>
+      (select(inspections)
+        ..orderBy([(t) => OrderingTerm.desc(t.createdAt)])
+        ..limit(1)).getSingleOrNull();
+
+  // For checking task progress in current session
+  Future<List<TaskResult>> getLatestResultsForVin(String vin) async {
+    final latest = await (select(inspections)
+      ..where((t) => t.vin.equals(vin))
+      ..orderBy([(t) => OrderingTerm.desc(t.createdAt)])
+      ..limit(1)).getSingleOrNull();
+    
+    if (latest == null) return [];
+    return getResultsForInspection(latest.id);
+  }
+}
+
+// Global instance
+final db = AppDatabase();

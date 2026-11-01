@@ -1,0 +1,1016 @@
+"""
+connector.py -- PC side of Runner Cam (phone camera as a CCTV-style feed).
+
+The phone app serves an MJPEG stream (like IP Webcam). This program:
+  1. SCANS the Wi-Fi/hotspot for phones (HTTP /ping sweep of every local /24
+     + UDP beacon on 8092),
+  2. reads the chosen phone with plain OpenCV  cv2.VideoCapture(url)  -- the same
+     call used for a webcam/CCTV, so detection code can be plugged in later,
+  3. shows the feed + stats + debug log in a browser page (http://127.0.0.1:8095),
+     optionally also in an OpenCV window (--window).
+
+    python connector.py                 # scan, auto-connect if exactly one phone
+    python connector.py --url http://192.168.1.50:8080/video
+    python connector.py --window --no-browser
+
+Debug mode is ON by default (--no-debug to quiet). Everything is also written to
+connector_debug.log next to the program.
+"""
+import os
+
+# Must be set before cv2 is imported: low-latency ffmpeg reading, 5 s I/O timeout.
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "fflags;nobuffer|flags;low_delay|probesize;32768|analyzeduration;0|rw_timeout;3000000")
+
+import argparse
+import collections
+import json
+import socket
+import sys
+import threading
+import time
+import traceback
+import urllib.request
+import webbrowser
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+import cv2
+import numpy as np
+
+from inspector import Inspector, load_config, load_tasks
+import pack as packmod
+
+VERSION = "0.2.0"
+PHONE_APP = "runner-cam-phone"
+PC_APP = "runner-cam-pc"
+BEACON_PORT = 8092
+DEBUG = True
+
+LOG = collections.deque(maxlen=500)
+_logf = None
+
+
+def log(msg, level="INFO", debug_only=False):
+    if debug_only and not DEBUG:
+        return
+    line = f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} [{level}] {msg}"
+    LOG.append(line)
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass
+    if _logf:
+        try:
+            _logf.write(line + "\n")
+            _logf.flush()
+        except Exception:
+            pass
+
+
+def app_dir():
+    return os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
+
+
+# ------------------------------------------------------------------ scan --
+
+
+def local_ips():
+    ips = set()
+    try:
+        for i in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(i[4][0])
+    except Exception:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))
+        ips.add(s.getsockname()[0])
+        s.close()
+    except Exception:
+        pass
+    return sorted(i for i in ips if not i.startswith("127."))
+
+
+def probe(ip, port, timeout=0.7):
+    try:
+        with urllib.request.urlopen(f"http://{ip}:{port}/ping", timeout=timeout) as r:
+            j = json.loads(r.read(2000).decode())
+        if j.get("app") == PHONE_APP:
+            return {"ip": ip, "port": j.get("port", port), "name": j.get("name", ip)}
+    except Exception:
+        pass
+    return None
+
+
+def listen_beacon(seconds, out):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("", BEACON_PORT))
+        s.settimeout(0.5)
+        end = time.time() + seconds
+        while time.time() < end:
+            try:
+                data, _ = s.recvfrom(1024)
+                j = json.loads(data.decode())
+                if j.get("app") == PHONE_APP:
+                    out.append({"ip": j["ip"], "port": j["port"], "name": j.get("name", j["ip"])})
+            except socket.timeout:
+                pass
+            except Exception:
+                pass
+    except Exception as e:
+        log(f"beacon listen failed (sweep still works): {e}", "WARN")
+    finally:
+        s.close()
+
+
+def scan(port=8080, extra_ips=(), quiet=False):
+    def log(m, level="INFO", debug_only=False):  # a quiet (background) scan only logs in debug mode
+        globals()["log"](m, level, debug_only or quiet)
+    ips = local_ips()
+    log(f"scan: this PC has {ips or 'NO network address'}; sweeping /24 on port {port}")
+    if not ips:
+        log("scan: connect the PC to the same Wi-Fi as the phone (or to the phone's hotspot)", "ERROR")
+    hosts = ["127.0.0.1"] + list(extra_ips)
+    bases = []
+    for ip in ips:
+        a, b, c, _ = ip.split(".")
+        for cc in (int(c), int(c) ^ 1):  # also the neighbouring /24: covers /23 networks like 10.3.64.0/23
+            if f"{a}.{b}.{cc}" not in bases:
+                bases.append(f"{a}.{b}.{cc}")
+    for base in bases:
+        hosts += [f"{base}.{n}" for n in range(1, 255)]
+    found, beacon = {}, []
+    t = threading.Thread(target=listen_beacon, args=(3, beacon), daemon=True)
+    t.start()
+    with ThreadPoolExecutor(64) as ex:
+        for r in ex.map(lambda h: probe(h, port), hosts):
+            if r:
+                found[(r["ip"], r["port"])] = r
+    t.join()
+    for r in beacon:
+        found.setdefault((r["ip"], r["port"]), r)
+    if any(ip in ips for ip, _ in found):  # same machine seen as loopback and as its LAN address
+        found = {k: v for k, v in found.items() if k[0] != "127.0.0.1"}
+    phones = list(found.values())
+    log(f"scan done: {len(phones)} phone(s): " + ", ".join(f"{p['name']} {p['ip']}:{p['port']}" for p in phones))
+    return phones
+
+
+# ------------------------------------------------------------- diagnose --
+
+
+def diagnose(url, opencv_failed=True):
+    """Plain-socket checks that explain WHY a stream cannot be opened (OpenCV only says 'cannot open')."""
+    u = urlparse(url)
+    host, port = u.hostname, u.port or 80
+    log(f"diagnose: PC addresses {local_ips() or 'NONE'}  ->  phone {host}:{port}", "WARN")
+    t = time.monotonic()
+    try:
+        s = socket.create_connection((host, port), timeout=4)
+        s.close()
+        log(f"diagnose: TCP connect OK ({(time.monotonic() - t) * 1000:.0f} ms) -- the phone is reachable", "WARN")
+    except socket.timeout:
+        log("diagnose: TCP connect TIMED OUT. Packets are being dropped: PC and phone are on different "
+            "networks/VLANs, or the Wi-Fi blocks device-to-device traffic (client isolation), or a firewall. "
+            "Try the phone's hotspot.", "ERROR")
+        return False, "PC cannot reach the phone: TCP connect timed out (different VLAN / Wi-Fi client isolation / firewall)"
+    except ConnectionRefusedError:
+        log(f"diagnose: connection REFUSED. The phone answered but nothing listens on port {port}: "
+            "is 'Start camera server' pressed, and is the port the same as in the app?", "ERROR")
+        return False, f"PC reached the phone but port {port} refused the connection (camera server not started?)"
+    except OSError as e:
+        log(f"diagnose: cannot reach {host}: [{e.errno}] {e}. Usually 'no route' = different network.", "ERROR")
+        return False, f"PC cannot reach the phone: {e}"
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/ping", timeout=4) as r:
+            body = r.read(300).decode(errors="replace")
+        log(f"diagnose: /ping answered: {body}", "WARN")
+    except Exception as e:
+        log(f"diagnose: TCP ok but /ping failed: {type(e).__name__}: {e}", "ERROR")
+        return False, f"PC reached the phone but /ping failed: {type(e).__name__}: {e}"
+    try:
+        r = urllib.request.urlopen(f"http://{host}:{port}/video", timeout=6)
+        head = r.read(64)
+        log(f"diagnose: /video HTTP {r.status}, type={r.headers.get('Content-Type')}, first bytes={head[:24]!r}", "WARN")
+        r.close()
+        if opencv_failed:
+            log("diagnose: network and phone are fine; OpenCV/ffmpeg itself failed to decode -- send this log", "ERROR")
+        return True, "PC reached the phone and /video answers"
+    except Exception as e:
+        log(f"diagnose: /video request failed: {type(e).__name__}: {e} (phone camera may not have started "
+            "-- check the phone's DEBUG LOG)", "ERROR")
+        return False, f"PC reached the phone but /video failed: {type(e).__name__}: {e}"
+
+
+# ---------------------------------------------------------------- reader --
+
+
+def tcp_open(host, port, timeout=1.5):
+    try:
+        socket.create_connection((host, port), timeout=timeout).close()
+        return True
+    except OSError:
+        return False
+
+
+class Reader(threading.Thread):
+    """Reads the stream with cv2.VideoCapture; keeps only the newest frame."""
+
+    def __init__(self, url, name=None):
+        super().__init__(daemon=True)
+        self.url = url
+        u = urlparse(url)
+        self.key = f"{u.hostname}:{u.port or 80}"
+        self.name = name or u.hostname
+        self.stop_flag = False
+        self.lock = threading.Lock()
+        self.frame = None
+        self.frame_id = 0
+        self.frames = 0
+        self.fails = 0
+        self.reconnects = 0
+        self.size = None
+        self.fps = 0.0
+        self.last_frame_t = 0.0
+        self.state = "connecting"
+        self.read_ms = 0.0
+
+    def run(self):
+        while not self.stop_flag:
+            host, port = self.key.rsplit(":", 1)
+            if not tcp_open(host, int(port)):  # refused/unreachable answers at once; OpenCV would take ~6 s to say so
+                self.state = "phone not reachable (retrying)"
+                if self.reconnects % 10 == 0:
+                    log(f"{self.name}: {self.key} not reachable", "WARN")
+                    diagnose(self.url, opencv_failed=False)
+                self.reconnects += 1
+                time.sleep(2)
+                continue
+            log(f"opening {self.url}", debug_only=True)
+            cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+            if not cap.isOpened():
+                self.state = "cannot open (retrying)"
+                log(f"cannot open {self.url} (attempt {self.reconnects + 1})", "ERROR")
+                cap.release()
+                if self.reconnects % 10 == 0:
+                    diagnose(self.url)
+                self.reconnects += 1
+                time.sleep(2)
+                continue
+            self.state = "live"
+            log(f"connected to {self.url}")
+            n, t0, consecutive = 0, time.monotonic(), 0
+            while not self.stop_flag:
+                t = time.monotonic()
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    consecutive += 1
+                    self.fails += 1
+                    if consecutive >= 20:
+                        log(f"stream stalled / closed by phone after {self.frames} frames "
+                            f"(last frame {time.time() - self.last_frame_t:.1f}s ago) -> reconnecting", "WARN")
+                        diagnose(self.url, opencv_failed=False)  # is the phone still reachable, does /video answer?
+                        break
+                    time.sleep(0.05)
+                    continue
+                consecutive = 0
+                self.read_ms = (time.monotonic() - t) * 1000
+                with self.lock:
+                    self.frame = frame
+                    self.frame_id += 1
+                self.frames += 1
+                self.last_frame_t = time.time()
+                if self.size is None or self.size != (frame.shape[1], frame.shape[0]):
+                    self.size = (frame.shape[1], frame.shape[0])
+                    log(f"frame size {self.size[0]}x{self.size[1]}")
+                n += 1
+                now = time.monotonic()
+                if now - t0 >= 1.0:
+                    self.fps = round(n / (now - t0), 1)
+                    n, t0 = 0, now
+                    log(f"fps {self.fps}  total {self.frames}  failed reads {self.fails}", debug_only=True)
+            cap.release()
+            if not self.stop_flag:
+                self.state = "reconnecting"
+                self.reconnects += 1
+                time.sleep(1)
+
+    def stop(self):
+        self.stop_flag = True
+
+    def get(self):
+        with self.lock:
+            return self.frame, self.frame_id
+
+    def status(self):
+        age = round(time.time() - self.last_frame_t, 1) if self.last_frame_t else None
+        return {"key": self.key, "name": self.name, "url": self.url, "state": self.state, "fps": self.fps if age is not None and age < 3 else 0,
+                "frames": self.frames, "failed_reads": self.fails, "reconnects": self.reconnects,
+                "size": f"{self.size[0]}x{self.size[1]}" if self.size else None,
+                "seconds_since_frame": age, "read_ms": round(self.read_ms, 1)}
+
+
+# ------------------------------------------------------------------ http --
+
+STATE = {"readers": {}, "phones": [], "scanning": False, "port": 8080, "ui_port": 8095, "active": None}
+INSPECTOR = None  # inspector.Inspector (YOLO .pt checks on the active phone), created in main()
+STATE_LOCK = threading.Lock()
+
+
+def connect(url, name=None):
+    """Start (or restart) reading one phone. Many phones can be connected at once."""
+    r = Reader(url, name)
+    with STATE_LOCK:
+        old = STATE["readers"].get(r.key)
+        if old:
+            old.stop()
+        STATE["readers"][r.key] = r
+    r.start()
+    log(f"connecting to {url} as '{r.name}' ({len(STATE['readers'])} phone(s) connected)")
+
+
+DISMISSED = set()  # phones the user disconnected by hand: auto-scan must not reconnect them
+
+
+def disconnect(key):
+    DISMISSED.add(key)
+    with STATE_LOCK:
+        r = STATE["readers"].pop(key, None)
+    if r:
+        r.stop()
+        log(f"disconnected {key}")
+
+
+def active_reader():
+    """The phone being inspected: the one chosen with 'Inspect', else the first connected."""
+    rs = STATE["readers"]
+    return rs.get(STATE["active"]) or next(iter(rs.values()), None)
+
+
+def inspector_frame():
+    r = active_reader()
+    if r is None:
+        return None, -1
+    f, fid = r.get()
+    return f, (r.key, fid)
+
+
+def first_reader(key=None):
+    rs = STATE["readers"]
+    if key and key in rs:
+        return rs[key]
+    return next(iter(rs.values()), None)
+
+
+def do_scan():
+    if STATE["scanning"]:
+        return
+    STATE["scanning"] = True
+    try:
+        STATE["phones"] = scan(STATE["port"])
+    except Exception:
+        log(f"scan crashed: {traceback.format_exc()}", "ERROR")
+    finally:
+        STATE["scanning"] = False
+
+
+def auto_scan_loop(interval):
+    """Phones appear by themselves: rescan now and then, connect to any new one (outbound traffic only)."""
+    empty = 0
+    while True:
+        time.sleep(interval)
+        if STATE["scanning"]:
+            continue
+        try:
+            found = scan(STATE["port"], quiet=True)
+            empty = 0 if (found or STATE["readers"]) else empty + 1
+            if empty == 4:
+                log("no phone seen for a minute. If the phone really is on the same Wi-Fi, that Wi-Fi probably blocks "
+                    "device-to-device traffic (client isolation, common on office Wi-Fi). Test: open "
+                    f"http://{(local_ips() or ['<this-pc-ip>'])[0]}:{STATE['ui_port']}/ in the PHONE's browser -- "
+                    "if that fails too, use the phone's hotspot (or a Wi-Fi without isolation).", "WARN")
+            for p in found:
+                key = f"{p['ip']}:{p['port']}"
+                if key not in STATE["readers"] and key not in DISMISSED:
+                    log(f"auto-scan found a new phone: {p['name']} {key} -> connecting")
+                    connect(f"http://{key}/video", p["name"])
+        except Exception:
+            log(f"auto-scan error: {traceback.format_exc()}", "ERROR")
+
+
+# ---- QR code the phone scans to find this PC (no network scan needed) ----
+
+
+def qr_payload():
+    return json.dumps({"app": PC_APP, "ips": local_ips(), "port": STATE["ui_port"],
+                       "name": socket.gethostname()}, separators=(",", ":"))
+
+
+def qr_matrix(text):
+    import qrcode
+    q = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, border=0)
+    q.add_data(text)
+    q.make(fit=True)
+    return q.get_matrix()
+
+
+def qr_svg(text):
+    m = qr_matrix(text)
+    n, b = len(m), 3
+    rects = "".join(f'<rect x="{x + b}" y="{y + b}" width="1" height="1"/>'
+                    for y, row in enumerate(m) for x, v in enumerate(row) if v)
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {n + 2 * b} {n + 2 * b}" '
+            f'shape-rendering="crispEdges"><rect width="100%" height="100%" fill="#fff"/>'
+            f'<g fill="#000">{rects}</g></svg>')
+
+
+def print_qr_console(text):
+    try:
+        m = qr_matrix(text)
+        pad = [[False] * (len(m) + 4) for _ in range(2)]
+        rows = pad + [[False, False] + r + [False, False] for r in m] + pad
+        print("\nScan this QR with the Runner Cam phone app ('Scan QR'):\n")
+        for y in range(0, len(rows), 2):
+            line = ""
+            for x in range(len(rows[0])):
+                top = rows[y][x]
+                bot = rows[y + 1][x] if y + 1 < len(rows) else False
+                line += "\u2588" if top and bot else "\u2580" if top else "\u2584" if bot else " "
+            print(line)
+        print()
+    except Exception as e:  # console encoding / missing lib -- the viewer page still shows the QR
+        log(f"could not print QR in console ({type(e).__name__}); open the viewer page instead", "WARN", debug_only=True)
+
+
+PAGE = """<!doctype html><meta charset=utf-8><title>PC Runner</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>body{margin:0;font:14px system-ui,sans-serif;background:#111;color:#ddd}
+header{padding:10px 16px;background:#0b6fa4;color:#fff;font-weight:600}
+main{display:flex;flex-wrap:wrap;gap:16px;padding:16px}#feeds{flex:2 1 480px;display:grid;gap:10px;
+grid-template-columns:repeat(auto-fit,minmax(280px,1fr));align-content:start}
+.tile{background:#000;border-radius:6px;overflow:hidden}.tile img{width:100%;display:block;min-height:160px;max-height:calc(100vh - 230px);object-fit:contain;background:#000}
+.tile div{padding:4px 8px;font-size:12px;display:flex;justify-content:space-between}
+#side{flex:1 1 320px}#qr{background:#fff;padding:6px;border-radius:8px;width:230px}
+pre{background:#000;color:#9f9;padding:8px;border-radius:6px;overflow:auto;max-height:300px;font-size:12px;margin:0}
+#banner{padding:12px 16px;font-size:26px;font-weight:700;color:#fff;background:#444;display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+#banner small{font-size:13px;font-weight:400;flex:1;min-width:200px}#banner select,#banner input{font-size:15px;padding:5px}
+#banner button{font-size:15px;padding:6px 12px}.tile.act{outline:3px solid #1a8f3a}
+button{padding:5px 10px;margin:2px}
+#feeds .tile{position:relative}.roi{position:absolute;border:3px solid #0f0;background:#00ff0022;pointer-events:none;display:none;box-sizing:border-box}
+body.roimode .tile img{cursor:crosshair}#packlbl{font-size:13px;font-weight:400}
+body.big header,body.big #side{display:none}body.big #feeds{flex:1 1 100%}body.big main{padding:6px}body.big .tile:not(.act){display:none}
+body.big .tile img{max-height:calc(100vh - 120px);min-height:300px}body.big #banner{font-size:34px}
+#ov{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;z-index:9}#ov.on{display:flex}
+#dlg{background:#1a222d;border:1px solid #2c3848;border-radius:12px;width:min(560px,96vw);max-height:95vh;overflow:auto;padding:18px;color:#e8edf3}
+#dlg h3{margin:0 0 8px}#dlg label{display:block;color:#8b9aab;font-size:12px;margin:12px 0 5px}#dlg small{font-weight:400}
+.drow{display:flex;gap:10px}.drow>*{flex:1}#dlg select,#dlg input{width:100%;box-sizing:border-box;background:#0e131a;color:#e8edf3;border:1px solid #2c3848;border-radius:6px;padding:8px;font:inherit}
+.dfoot{display:flex;justify-content:space-between;margin-top:16px}#dmsg{color:#f88;min-height:18px;margin-top:8px}
+.dd{position:relative}.dd .box{background:#0e131a;border:1px solid #2c3848;border-radius:6px;padding:7px 9px;min-height:38px;cursor:pointer;display:flex;flex-wrap:wrap;gap:5px;align-items:center}
+.dd .box:after{content:"\\25BE";margin-left:auto;color:#8b9aab}.dd .box i{color:#8b9aab;font-style:normal}
+.dd .menu{display:none;position:absolute;z-index:5;left:0;right:0;background:#0e131a;border:1px solid #2c3848;border-radius:6px;margin-top:2px;max-height:180px;overflow:auto}
+.dd.open .menu{display:block}.dd .menu label{display:flex;gap:8px;align-items:center;margin:0;padding:8px 10px;color:#e8edf3;font-size:14px;cursor:pointer}
+.dd .menu label:hover{background:#1a222d}.dd .menu label.dis{opacity:.4;cursor:not-allowed}
+.tag{padding:3px 10px;border-radius:99px;font-size:13px;border:1px solid}.tag.pass{background:#12331f;border-color:#2fb86b;color:#7be0a6}
+.tag.fail{background:#3a1618;border-color:#e5484d;color:#ff9a9d}.tag.ignore{background:#242b35;border-color:#8b9aab;color:#8b9aab}td{padding:2px 8px 2px 0}.bad{color:#f66}.ok{color:#6f6}</style>
+<header>PC Runner <span id=ver></span></header>
+<div id=banner><span id=res>...</span><small id=insp></small>
+<select id=msel onchange="fetch('/api/model?name='+encodeURIComponent(msel.value),{method:'POST'});curTask='';loadTasks(true)"></select>
+<select id=tsel onchange="pickTask(tsel.value)"></select>
+<button onclick="openTask(false)">+ Create task</button><button id=editbtn onclick="openTask(true)">Edit task</button>
+<button id=runbtn onclick="toggleRun()" style="background:#1a8f3a;color:#fff"></button>
+<span id=vinbox style="display:none"><input id=vin placeholder="VIN" onkeydown="if(event.key==='Enter')sendVin()"> <button onclick="sendVin()">Start</button></span>
+<button id=nextbtn onclick="fetch('/api/restart',{method:'POST'})" style="display:none">Next car (Space)</button>
+<select id=modesel onchange="fetch('/api/mode?m='+modesel.value,{method:'POST'})" title="Pack = scan a label, tasks come from the app pack. Manual = the task you choose below, repeated for every car"><option value=pack>Mode: scan label (app pack)</option><option value=manual>Mode: manual task</option></select>
+<label style="font-size:13px"><input type=checkbox id=autost onchange="fetch('/api/autostart?on='+(autost.checked?1:0),{method:'POST'})"> auto-start next scan</label>
+<label style="font-size:13px"><input type=checkbox id=autosc onchange="fetch('/api/autoscan?on='+(autosc.checked?1:0),{method:'POST'})"> auto-read label</label>
+<button id=scanbtn onclick="fetch('/api/scanlabel',{method:'POST'}).then(r=>r.json()).then(j=>{insp.textContent=j.message})" style="display:none;background:#0b6fa4;color:#fff">Scan label</button>
+<button id=startbtn onclick="fetch('/api/start',{method:'POST'})" style="display:none;background:#1a8f3a;color:#fff">START</button>
+<button id=retrybtn onclick="fetch('/api/retry',{method:'POST'})" style="display:none">Retry</button>
+<input type=file id=packfile accept=".zip" style="display:none" onchange="importPack(this.files[0])">
+<button onclick="packfile.click()" title="Zip from the Flutter platform: Download for PC">Import app pack</button><span id=packlbl>No app pack imported</span>
+<button id=roibtn onclick="toggleRoi()" title="Draw the square where the QR code is: only that part is read">Set scan square</button><button onclick="clearRoi()">Clear square</button>
+<button id=expbtn onclick="expand()" title="Enlarge the inspection screen (F, Esc to exit)">&#x26F6; Expand</button></div>
+<div id=ov><div id=dlg>
+<h3 id=dttl>Create task</h3>
+<div class=drow><div><label>Model (.pt)</label><select id=dmodel onchange="loadClasses()"></select></div>
+<div><label>Task name</label><input id=dname placeholder="e.g. Headlamp"></div></div>
+<label>Pass classes <small>(all selected must be seen for OK)</small></label><div class=dd id=dd_pass></div>
+<label>Fail classes <small>(any one seen = NOT OK)</small></label><div class=dd id=dd_fail></div>
+<label>Ignore classes <small>(never counted)</small></label><div class=dd id=dd_ignore></div>
+<div class=drow><div><label>Scan time (seconds) <small>longest the inspection looks for a result</small></label><input id=dscan type=number min=1 value=45></div>
+<div><label>Min confidence <small>0.05 - 0.99</small></label><input id=dconf type=number min=0.05 max=0.99 step=0.05 value=0.5></div></div>
+<div id=dmsg></div>
+<div class=dfoot><span><button onclick="closeTask()">Cancel</button> <button id=delbtn onclick="delTask()" style="background:#7a1f1f;color:#fff">Delete</button></span>
+<button onclick="saveTask()" style="background:#1a8f3a;color:#fff">Save task</button></div></div></div>
+<main>
+<div id=feeds><i id=nofeed>No phone connected yet. On the phone: tap <b>Scan QR</b> and scan the code on the right.</i></div>
+<div id=side>
+<h3>Connect a phone</h3>
+<img id=qr src="/qr.svg" alt="QR"><div id=addr></div>
+<small>Phone app: Scan QR (many phones can connect to this PC).</small>
+<h3>Phones found by scan <button onclick="fetch('/api/scan',{method:'POST'})">Scan</button><span id=scanning></span></h3>
+<div id=phones></div>
+<h3>Connections</h3><table id=st></table>
+<h3>Manual URL</h3><input id=u size=30 placeholder="http://192.168.1.50:8080/video">
+<button onclick="go(u.value)">Connect</button>
+<h3>Debug log</h3><pre id=log></pre></div></main>
+<script>
+
+let tasks=[],curTask='',editing=false,cls=[],pick={pass:[],fail:[],ignore:[]};
+function taken(c,k){return Object.keys(pick).some(x=>x!==k&&pick[x].includes(c))}
+function renderDD(){for(const k of ['pass','fail','ignore']){const d=document.getElementById('dd_'+k);const open=d.classList.contains('open');
+ d.innerHTML='<div class=box>'+(pick[k].length?pick[k].map(c=>'<span class="tag '+k+'">'+c+'</span>').join(''):'<i>Select classes...</i>')+'</div><div class=menu>'+
+  (cls.length?cls.map(c=>'<label class="'+(taken(c,k)?'dis':'')+'"><input type=checkbox data-c="'+c+'" '+(pick[k].includes(c)?'checked ':'')+(taken(c,k)?'disabled':'')+'>'+c+(taken(c,k)?' <small>(used elsewhere)</small>':'')+'</label>').join(''):'<label>pick a model first</label>')+'</div>';
+ if(open)d.classList.add('open');
+ d.querySelector('.box').onclick=()=>{const o=d.classList.contains('open');document.querySelectorAll('.dd').forEach(x=>x.classList.remove('open'));if(!o)d.classList.add('open')};
+ d.querySelectorAll('input').forEach(i=>i.onchange=()=>{const c=i.dataset.c;pick[k]=i.checked?[...pick[k],c]:pick[k].filter(x=>x!==c);renderDD()})}}
+async function loadClasses(){dmsg.textContent='';cls=[];renderDD();if(!dmodel.value)return;
+ const r=await (await fetch('/api/classes?model='+encodeURIComponent(dmodel.value))).json();
+ cls=r.classes||[];if(r.error)dmsg.textContent=r.error;pick={pass:pick.pass.filter(c=>cls.includes(c)),fail:pick.fail.filter(c=>cls.includes(c)),ignore:pick.ignore.filter(c=>cls.includes(c))};renderDD()}
+async function openTask(edit){editing=edit;let t=null;if(edit){t=tasks.find(x=>x.name===curTask);if(!t){alert('Pick a task to edit first.');return}}
+ const m=await (await fetch('/api/models')).json();
+ dmodel.innerHTML=m.models.map(n=>'<option'+((t?t.model:m.current)===n?' selected':'')+'>'+n+'</option>').join('');
+ dttl.textContent=edit?'Edit task: '+t.name:'Create task';dname.value=t?t.name:'';dname.readOnly=!!t;
+ dscan.value=t?t.scan_seconds:45;dconf.value=t?t.conf:0.5;delbtn.style.display=t?'':'none';
+ pick=t?{pass:[...t.pass],fail:[...t.fail],ignore:[...t.ignore]}:{pass:[],fail:[],ignore:[]};
+ ov.classList.add('on');loadClasses()}
+function closeTask(){ov.classList.remove('on')}
+async function saveTask(){const body={name:dname.value.trim(),model:dmodel.value,pass:pick.pass,fail:pick.fail,ignore:pick.ignore,scan_seconds:+dscan.value,conf:+dconf.value};
+ const r=await (await fetch('/api/task/save',{method:'POST',body:JSON.stringify(body)})).json();
+ if(!r.ok){dmsg.textContent=r.message;return}
+ closeTask();curTask=body.name;await loadTasks(true);pickTask(curTask)}
+async function delTask(){if(!confirm('Delete task '+curTask+'?'))return;await fetch('/api/task/delete?name='+encodeURIComponent(curTask),{method:'POST'});closeTask();curTask='';loadTasks(true)}
+function pickTask(n){curTask=n;if(n)fetch('/api/task?name='+encodeURIComponent(n),{method:'POST'})}
+let tasksShown='';
+async function loadTasks(force){try{const r=await (await fetch('/api/tasks')).json();tasks=r.tasks;const model=msel.value;
+ const mine=tasks.filter(t=>t.model===model);const sig=model+'|'+mine.map(t=>t.name).join(',')+'|'+(r.current||'');
+ if(!force&&sig===tasksShown)return;tasksShown=sig;if(r.current)curTask=r.current;
+ tsel.innerHTML='<option value="">'+(mine.length?'-- choose task --':'no tasks for this model')+'</option>'+mine.map(t=>'<option'+(t.name===curTask?' selected':'')+'>'+t.name+'</option>').join('');
+ if(!mine.some(t=>t.name===curTask))tsel.value=''}catch(e){}}
+let isPrev=true,curHas=false;
+function toggleRun(){if(isPrev){if(!curHas){alert('Choose or create a task first.');return}fetch('/api/preview?on=0',{method:'POST'})}else fetch('/api/preview?on=1',{method:'POST'})}
+function go(url){fetch('/api/connect?url='+encodeURIComponent(url),{method:'POST'})}
+function sendVin(){const v=vin.value.trim();if(v){fetch('/api/vin?vin='+encodeURIComponent(v),{method:'POST'});vin.value=''}}
+function inspectCam(k){fetch('/api/inspect?cam='+encodeURIComponent(k),{method:'POST'})}
+let modelsShown='';
+async function loadModels(){try{const m=await (await fetch('/api/models')).json();const sig=m.models.join('|')+m.current;
+ if(sig===modelsShown)return;modelsShown=sig;
+ msel.innerHTML=(m.models.length?'':'<option value="">no .pt next to the exe</option>')+m.models.map(n=>'<option'+(n===m.current?' selected':'')+'>'+n+'</option>').join('')}catch(e){}}
+document.addEventListener('keydown',e=>{if(e.code==='Space'&&e.target.tagName!=='INPUT'){e.preventDefault();fetch('/api/restart',{method:'POST'})}});
+function expand(on){const b=document.body.classList;const v=(on===undefined)?!b.contains('big'):on;b.toggle('big',v);expbtn.textContent=v?'\u2715 Exit (Esc)':'\u26F6 Expand';
+ try{if(v&&!document.fullscreenElement)document.documentElement.requestFullscreen();else if(!v&&document.fullscreenElement)document.exitFullscreen()}catch(e){}}
+document.addEventListener('keydown',e=>{if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT')return;if(e.key==='f'||e.key==='F')expand();else if(e.key==='Escape')expand(false)});
+document.addEventListener('fullscreenchange',()=>{if(!document.fullscreenElement&&document.body.classList.contains('big'))expand(false)});
+let roiMode=false,roi=null,drag=null;
+function contentRect(img){const w=img.clientWidth,h=img.clientHeight,nw=img.naturalWidth||w,nh=img.naturalHeight||h;const s=Math.min(w/nw,h/nh);const cw=nw*s,ch=nh*s;return{x:(w-cw)/2,y:(h-ch)/2,w:cw,h:ch}}
+function drawRoi(){document.querySelectorAll('.tile').forEach(t=>{let d=t.querySelector('.roi');if(!d){d=document.createElement('div');d.className='roi';t.appendChild(d)}
+ const r=(drag&&drag.r)||(drag?null:roi),img=t.querySelector('img');if(!r||!img||(!drag&&!t.classList.contains('act'))){d.style.display='none';return}
+ const c=contentRect(img);d.style.display='block';d.style.left=(c.x+r[0]*c.w)+'px';d.style.top=(c.y+r[1]*c.h)+'px';d.style.width=((r[2]-r[0])*c.w)+'px';d.style.height=((r[3]-r[1])*c.h)+'px'})}
+function frac(e,img){const b=img.getBoundingClientRect(),c=contentRect(img);return[Math.min(1,Math.max(0,(e.clientX-b.left-c.x)/c.w)),Math.min(1,Math.max(0,(e.clientY-b.top-c.y)/c.h))]}
+feeds.addEventListener('mousedown',e=>{if(roiMode&&e.target.tagName==='IMG'){e.preventDefault();drag={img:e.target,a:frac(e,e.target),r:null}}});
+document.addEventListener('mousemove',e=>{if(!drag)return;const p=frac(e,drag.img);drag.r=[Math.min(drag.a[0],p[0]),Math.min(drag.a[1],p[1]),Math.max(drag.a[0],p[0]),Math.max(drag.a[1],p[1])];drawRoi()});
+document.addEventListener('mouseup',()=>{if(!drag)return;const r=drag.r;drag=null;if(r&&r[2]-r[0]>0.03&&r[3]-r[1]>0.03){roi=r;fetch('/api/roi?x1='+r[0]+'&y1='+r[1]+'&x2='+r[2]+'&y2='+r[3],{method:'POST'})}drawRoi()});
+function toggleRoi(){roiMode=!roiMode;roibtn.textContent=roiMode?'Drag a square on the video (click to stop)':'Set scan square';document.body.classList.toggle('roimode',roiMode)}
+function clearRoi(){fetch('/api/roi?clear=1',{method:'POST'})}
+function importPack(f){if(!f)return;packlbl.dataset.busy=1;packlbl.textContent='importing '+f.name+' ...';
+ fetch('/api/pack/import',{method:'POST',body:f}).then(r=>r.json()).then(j=>{packlbl.textContent=j.message;packfile.value='';setTimeout(()=>delete packlbl.dataset.busy,4000)}).catch(()=>{packlbl.textContent='import failed';delete packlbl.dataset.busy})}
+function drop(k){fetch('/api/disconnect?cam='+encodeURIComponent(k),{method:'POST'})}
+let shown='';
+async function tick(){try{
+ const s=await (await fetch('/api/status')).json();
+ ver.textContent='v'+s.version+(s.debug?' (debug)':'');
+ addr.textContent=s.ips.map(i=>i+':'+s.ui_port).join('   ')||'no network address';
+ scanning.textContent=s.scanning?' scanning...':'';
+ phones.innerHTML=s.phones.map(p=>'<div>'+p.name+' '+p.ip+':'+p.port+
+  ' <button onclick="go(\\'http://'+p.ip+':'+p.port+'/video\\')">Connect</button></div>').join('')||'<i>none found yet</i>';
+ const keys=s.readers.map(r=>r.key).join(',');
+ if(keys!==shown){shown=keys;
+  feeds.innerHTML=s.readers.length?s.readers.map(r=>'<div class=tile data-k="'+r.key+'"><img src="/video?cam='+encodeURIComponent(r.key)+
+   '"><div><span>'+r.name+' ('+r.key+')</span><span><button onclick="inspectCam(\\''+r.key+'\\')">Inspect</button><button onclick="drop(\\''+r.key+'\\')">disconnect</button></span></div></div>').join(''):
+   '<i>No phone connected yet. On the phone: tap <b>Scan QR</b> and scan the code on the right.</i>';}
+ st.innerHTML='<tr><th>name<th>state<th>fps<th>size<th>frames<th>reconn</tr>'+s.readers.map(r=>'<tr><td>'+r.name+
+  '<td class='+(r.state=='live'?'ok':'bad')+'>'+r.state+'<td>'+r.fps+'<td>'+(r.size||'-')+'<td>'+r.frames+'<td>'+r.reconnects).join('');
+ const i=await (await fetch('/api/inspection')).json();
+ loadModels();loadTasks();isPrev=!!i.preview;curHas=!!i.task;runbtn.textContent=isPrev?'Start inspection':'Stop (boxes only)';runbtn.style.background=isPrev?'#1a8f3a':'#7a1f1f';vinbox.style.display=i.vin_mode?'':'none';
+ document.querySelectorAll('.tile').forEach(t=>t.classList.toggle('act',t.dataset.k===i.active));
+ roi=i.roi||null;drawRoi();if(!packlbl.dataset.busy)packlbl.textContent=i.pack&&i.pack.loaded?('Pack: '+i.pack.app_name+' ('+(i.pack.scan_types||[]).join('+')+', '+i.pack.tasks.length+' tasks)'):'No app pack imported';
+ const col={'OK':'#1a8f3a','NOT OK':'#c62828','NOT FOUND':'#ef6c00'};
+ res.textContent=i.result||(i.state==='idle'?(i.pack&&i.pack.loaded?'SCAN LABEL':'SCAN VIN'):(i.state==='scanning'?(i.preview?'BOXES ONLY':'SCANNING '+(i.seconds_left??'')):(i.state==='ready'?'PRESS START':i.state==='waiting'?'READY':(i.state==='no_model'?'NO MODEL':(i.state==='loading'?'LOADING':'...')))));
+ banner.style.background=col[i.result]||(i.state==='scanning'?'#0b6fa4':'#444');
+ insp.textContent=(i.vin?'VIN '+i.vin+'  |  ':'')+(i.task?'Task '+(i.task_n?(i.task_i+'/'+i.task_n+' '):'')+i.task+'  |  ':'')+(i.message||'')+(i.infer_ms?'  |  '+i.infer_ms+' ms':'')+(i.detections&&i.detections.length?'  |  '+i.detections.map(d=>d.name+' '+Math.round(d.conf*100)+'%').join(', '):'');
+ nextbtn.style.display=i.state==='done'?'':'none';nextbtn.textContent=(i.task_n&&i.task_i<i.task_n)?'Submit - next task (Space)':'Submit - next car (Space)';
+ retrybtn.style.display=i.state==='done'&&i.task&&i.task[0]!=='('?'':'none';startbtn.style.display=i.state==='ready'?'':'none';
+ scanbtn.style.display=(i.mode==='pack'&&i.pack&&i.pack.loaded&&i.state==='idle')?'':'none';if(document.activeElement!==modesel)modesel.value=i.mode||'pack';autost.checked=!!i.auto_start;autosc.checked=!!i.auto_scan;
+
+ const l=await (await fetch('/api/log')).json();
+ const end=log.scrollTop+log.clientHeight>=log.scrollHeight-20;
+ log.textContent=l.join('\\n');if(end)log.scrollTop=log.scrollHeight;
+}catch(e){}}
+setInterval(tick,1000);tick();</script>"""
+
+
+PREVIEW_W = 800            # phone preview is shrunk to this width: a phone screen needs no more, and it decodes fast
+_PREVIEW_CACHE = {}        # reader key -> (frame token, jpeg bytes)
+
+
+def preview_jpeg(r):
+    """(token, jpeg) of what the phone app should show for reader r; encoded once per new frame / result."""
+    ins = INSPECTOR
+    if r is None:
+        return None, None
+    if ins is not None and r is active_reader() and ins.state in ("scanning", "done") and ins.display:
+        tok = ("a", id(ins.display))
+        hit = _PREVIEW_CACHE.get(r.key)
+        if hit and hit[0] == tok:
+            return hit
+        arr = cv2.imdecode(np.frombuffer(ins.display, np.uint8), cv2.IMREAD_COLOR)
+        jpg = _shrink_jpeg(arr) if arr is not None else ins.display
+        _PREVIEW_CACHE[r.key] = (tok, jpg)
+        return _PREVIEW_CACHE[r.key]
+    f, fid = r.get()
+    if f is None:
+        return None, None
+    tok = fid  # the phone draws its own red scan box on top; nothing is burnt into this picture
+    hit = _PREVIEW_CACHE.get(r.key)
+    if hit and hit[0] == tok:
+        return hit
+    _PREVIEW_CACHE[r.key] = (tok, _shrink_jpeg(f))
+    return _PREVIEW_CACHE[r.key]
+
+
+def _shrink_jpeg(img):
+    h, w = img.shape[:2]
+    if w > PREVIEW_W:
+        img = cv2.resize(img, (PREVIEW_W, int(h * PREVIEW_W / w)), interpolation=cv2.INTER_AREA)
+    return cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 60])[1].tobytes()
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *a):
+        line = fmt % a
+        if "/api/" not in line and "/video" not in line:
+            log("http " + line, debug_only=True)
+
+    def _send(self, body, ctype="application/json", code=200, extra=None):
+        if isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _cam(self, key):
+        """cam=me -> the reader whose phone address is the caller (the phone app asking for its own view)."""
+        if key == "me":
+            ip = self.client_address[0]
+            return next((r for r in STATE["readers"].values() if r.key.split(":")[0] == ip), None)
+        return first_reader(key)
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+        if u.path == "/":
+            self._send(PAGE, "text/html")
+        elif u.path == "/ping":
+            self._send(json.dumps({"app": PC_APP, "version": VERSION, "name": socket.gethostname(),
+                                   "port": STATE.get("ui_port")}))
+        elif u.path == "/qr.svg":
+            try:
+                self._send(qr_svg(qr_payload()), "image/svg+xml")
+            except Exception as e:
+                log(f"QR failed: {type(e).__name__}: {e}", "ERROR")
+                self._send("QR unavailable", "text/plain", 500)
+        elif u.path == "/api/status":
+            self._send(json.dumps({"version": VERSION, "debug": DEBUG, "scanning": STATE["scanning"],
+                                   "phones": STATE["phones"], "ips": local_ips(), "ui_port": STATE["ui_port"],
+                                   "readers": [r.status() for r in STATE["readers"].values()]}))
+        elif u.path == "/api/inspection":
+            st = INSPECTOR.status() if INSPECTOR else {"state": "no_model", "message": "inspector not started"}
+            ar = active_reader()
+            st["active"] = ar.key if ar else None
+            self._send(json.dumps(st))
+        elif u.path == "/api/models":
+            self._send(json.dumps({"models": INSPECTOR.list_models() if INSPECTOR else [],
+                                   "current": INSPECTOR.cfg.get("model") if INSPECTOR else None}))
+        elif u.path == "/api/tasks":
+            self._send(json.dumps({"tasks": INSPECTOR.list_tasks() if INSPECTOR else [],
+                                   "current": INSPECTOR.task_name if INSPECTOR else None}))
+        elif u.path == "/api/classes":
+            names, err = INSPECTOR.get_classes(q.get("model", [""])[0]) if INSPECTOR else ([], "no inspector")
+            self._send(json.dumps({"classes": names, "error": err}))
+        elif u.path == "/api/log":
+            self._send(json.dumps(list(LOG)[-200:]))
+        elif u.path == "/preview.jpg":
+            # what the PC shows for this phone (boxes / result when it is the inspected one) -- used by the phone app.
+            # Long-poll: ?after=<X-Fid of the last picture> waits (<=1 s) for a NEW picture, so the phone gets each
+            # frame as soon as it exists (no fixed polling delay) and the PC never re-encodes the same frame twice.
+            r = self._cam(q.get("cam", [None])[0])
+            try:
+                after = q.get("after", [""])[0]
+            except Exception:
+                after = ""
+            t0 = time.time()
+            while True:
+                fid, jpg = preview_jpeg(r)
+                if jpg is None:
+                    if time.time() - t0 > 1.0:
+                        return self._send("no frame yet", "text/plain", 404)
+                elif str(fid) != after or time.time() - t0 > 1.0:
+                    break
+                time.sleep(0.01)
+            self._send(jpg, "image/jpeg", extra={"X-Fid": str(fid)})
+        elif u.path == "/snapshot.jpg":
+            r = first_reader(q.get("cam", [None])[0])
+            f = r.get()[0] if r else None
+            if f is None:
+                return self._send("no frame yet", "text/plain", 404)
+            self._send(cv2.imencode(".jpg", f)[1].tobytes(), "image/jpeg")
+        elif u.path == "/video":
+            self._video(q.get("cam", [None])[0])
+        else:
+            self._send("not found", "text/plain", 404)
+
+    def do_POST(self):
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+        if u.path == "/api/scan":
+            threading.Thread(target=do_scan, daemon=True).start()
+            self._send("{}")
+        elif u.path == "/api/register":
+            # the phone scanned our QR (or found us) and tells us where its stream is
+            phone = q.get("phone", [""])[0]
+            name = q.get("name", [""])[0] or None
+            log(f"phone {self.client_address[0]} registered itself: {phone} name={name}")
+            if not phone:
+                return self._send(json.dumps({"ok": False, "message": "no phone address given"}))
+            url = f"http://{phone}/video"
+            ok, msg = diagnose(url, opencv_failed=False)
+            if ok:
+                connect(url, name)
+                if INSPECTOR:
+                    INSPECTOR.phone_reconnected()
+                msg += " -- PC is now reading the stream"
+            self._send(json.dumps({"ok": ok, "message": msg}))
+        elif u.path == "/api/connect":
+            url = q.get("url", [""])[0]
+            if url.startswith("http"):
+                connect(url)
+            self._send("{}")
+        elif u.path == "/api/model":
+            ok = bool(INSPECTOR and INSPECTOR.select_model(q.get("name", [""])[0]))
+            self._send(json.dumps({"ok": ok}), code=200 if ok else 400)
+        elif u.path == "/api/task":
+            ok = bool(INSPECTOR and INSPECTOR.select_task(q.get("name", [""])[0]))
+            self._send(json.dumps({"ok": ok}), code=200 if ok else 400)
+        elif u.path == "/api/task/save":
+            try:
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+                ok, msg = INSPECTOR.save_task(body) if INSPECTOR else (False, "no inspector")
+            except Exception as e:
+                ok, msg = False, f"bad request: {e}"
+            self._send(json.dumps({"ok": ok, "message": msg}))
+        elif u.path == "/api/task/delete":
+            ok = bool(INSPECTOR and INSPECTOR.delete_task(q.get("name", [""])[0]))
+            self._send(json.dumps({"ok": ok}))
+        elif u.path == "/api/vin":
+            vin = q.get("vin", [""])[0]
+            ok = bool(INSPECTOR and INSPECTOR.vin_mode and INSPECTOR.set_vin(vin))
+            if ok:
+                log(f"VIN received: {vin}")
+            self._send(json.dumps({"ok": ok}), code=200 if ok else 409)
+        elif u.path == "/api/pack/import":
+            tmp = os.path.join(app_dir(), "_pack_upload.zip")
+            try:
+                left = int(self.headers.get("Content-Length") or 0)
+                with open(tmp, "wb") as f:
+                    while left > 0:
+                        chunk = self.rfile.read(min(1 << 20, left))
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        left -= len(chunk)
+                ok, msg, pk = packmod.import_pack(tmp, app_dir())
+            except Exception as e:
+                ok, msg, pk = False, f"import failed: {e}", None
+            finally:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            if ok and INSPECTOR:
+                INSPECTOR.load_pack(pk, switch=True)
+            log(("app pack: " if ok else "app pack FAILED: ") + msg, "INFO" if ok else "ERROR")
+            self._send(json.dumps({"ok": ok, "message": msg}))
+        elif u.path == "/api/pack/clear":
+            packmod.clear_pack(app_dir())
+            if INSPECTOR:
+                INSPECTOR.load_pack(None)
+            self._send("{}")
+        elif u.path == "/api/roi":
+            ok = False
+            if INSPECTOR:
+                if q.get("clear"):
+                    ok = INSPECTOR.set_roi(None)
+                else:
+                    try:
+                        ok = INSPECTOR.set_roi([float(q[k][0]) for k in ("x1", "y1", "x2", "y2")])
+                    except (KeyError, ValueError):
+                        ok = False
+            self._send(json.dumps({"ok": ok}), code=200 if ok else 400)
+        elif u.path == "/api/mode":
+            ok = bool(INSPECTOR and INSPECTOR.set_mode(q.get("m", [""])[0]))
+            self._send(json.dumps({"ok": ok}), code=200 if ok else 400)
+        elif u.path == "/api/autostart":
+            if INSPECTOR:
+                INSPECTOR.set_auto_start(q.get("on", ["0"])[0] == "1")
+            self._send("{}")
+        elif u.path == "/api/autoscan":
+            if INSPECTOR:
+                INSPECTOR.set_auto_scan(q.get("on", ["0"])[0] == "1")
+            self._send("{}")
+        elif u.path == "/api/start":
+            ok = bool(INSPECTOR and INSPECTOR.start_scan())
+            self._send(json.dumps({"ok": ok}))
+        elif u.path == "/api/retry":
+            ok = bool(INSPECTOR and INSPECTOR.retry())
+            self._send(json.dumps({"ok": ok}))
+        elif u.path == "/api/scanlabel":
+            # the phone's Scan button: read the label in the scan square, answer with what happened
+            if not INSPECTOR:
+                return self._send(json.dumps({"ok": False, "message": "inspector not running"}))
+            INSPECTOR.request_scan()
+            t0 = time.time()
+            while INSPECTOR.scan_reply is None and time.time() - t0 < 7:
+                time.sleep(0.1)
+            self._send(json.dumps(INSPECTOR.scan_reply or {"ok": False, "message": "no answer from the inspector"}))
+        elif u.path == "/api/restart":
+            if INSPECTOR:
+                INSPECTOR.restart()
+            self._send("{}")
+        elif u.path == "/api/submit":
+            # phone's Submit: the result was already written to results.csv when the scan finished;
+            # this records the operator's confirmation and moves on to the next scan
+            if INSPECTOR:
+                log(f"SUBMIT from phone: {INSPECTOR.status().get('result')} (task {INSPECTOR.task_name})")
+                INSPECTOR.restart()
+            self._send("{}")
+        elif u.path == "/api/preview":
+            if INSPECTOR:
+                INSPECTOR.set_preview(q.get("on", ["1"])[0] == "1")
+            self._send("{}")
+        elif u.path == "/api/inspect":
+            key = q.get("cam", [""])[0]
+            if key in STATE["readers"]:
+                STATE["active"] = key
+                log(f"inspecting phone {key}")
+                if INSPECTOR:
+                    INSPECTOR.restart()
+            self._send("{}")
+        elif u.path == "/api/disconnect":
+            disconnect(q.get("cam", [""])[0])
+            self._send("{}")
+        else:
+            self._send("not found", "text/plain", 404)
+
+    def _video(self, cam):
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        last = -1
+        try:
+            while True:
+                r = first_reader(cam)
+                f, fid = r.get() if r else (None, -1)
+                ins = INSPECTOR
+                annotated = (ins is not None and r is active_reader() and ins.state in ("scanning", "done")
+                             and ins.display)
+                if annotated:  # boxes / result of the inspector for the phone being checked
+                    key = ("a", id(annotated))
+                    if key == last:
+                        time.sleep(0.02)
+                        continue
+                    last = key
+                    jpg = annotated
+                else:
+                    if f is None or fid == last:
+                        time.sleep(0.01)
+                        continue
+                    last = fid
+                    jpg = cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes()
+                self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                                 + str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
+
+# ------------------------------------------------------------------ main --
+
+
+def main():
+    global DEBUG, _logf
+    ap = argparse.ArgumentParser(description="Runner Cam PC connector")
+    ap.add_argument("--url", help="skip scan, read this stream, e.g. http://192.168.1.50:8080/video")
+    ap.add_argument("--phone-port", type=int, default=8080, help="port the phone app serves on")
+    ap.add_argument("--ui-port", type=int, default=8095, help="port of this program's viewer page (and QR)")
+    ap.add_argument("--no-debug", action="store_true")
+    ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--auto-scan", type=int, default=15, metavar="SEC",
+                    help="rescan every SEC seconds and connect new phones (0 = off)")
+    ap.add_argument("--no-scan", action="store_true", help="do not scan at start; wait for phones to scan the QR")
+    ap.add_argument("--window", action="store_true", help="also show an OpenCV window (first phone)")
+    ap.add_argument("--scan-only", action="store_true")
+    ap.add_argument("--no-inspect", action="store_true", help="video viewer only, no model")
+    a = ap.parse_args()
+    DEBUG = not a.no_debug
+    STATE["port"] = a.phone_port
+    STATE["ui_port"] = a.ui_port
+    try:
+        _logf = open(os.path.join(app_dir(), "connector_debug.log"), "a", encoding="utf-8")
+    except Exception as e:
+        print("cannot open log file:", e)
+
+    log(f"Runner Cam PC connector v{VERSION}  opencv {cv2.__version__}  debug={DEBUG}")
+    if a.scan_only:
+        do_scan()
+        return 0
+
+    try:
+        srv = ThreadingHTTPServer(("0.0.0.0", a.ui_port), Handler)
+    except OSError as e:
+        log(f"cannot open viewer port {a.ui_port}: {e} (use --ui-port)", "ERROR")
+        return 1
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    global INSPECTOR
+    if not a.no_inspect:
+        cfg = load_config(os.path.join(app_dir(), "runner_config.json"), log)
+        INSPECTOR = Inspector(cfg, app_dir(), log, inspector_frame, load_tasks(os.path.join(app_dir(), "tasks.json"), log))
+        try:
+            pk = packmod.load_pack(app_dir())
+            if pk:
+                INSPECTOR.load_pack(pk)
+        except Exception as e:
+            log(f"could not load pack.json: {e}", "ERROR")
+        INSPECTOR.start()
+    log(f"viewer + QR page: http://127.0.0.1:{a.ui_port}/   (PC addresses: {local_ips() or 'NONE'})")
+    log("Windows firewall popup -> Allow (Private AND Public), so phones can reach this PC.")
+    print_qr_console(qr_payload())
+    if not a.no_browser:
+        threading.Timer(1.0, lambda: webbrowser.open(f"http://127.0.0.1:{a.ui_port}/")).start()
+
+    if a.url:
+        connect(a.url)
+    elif not a.no_scan:
+        do_scan()
+        if len(STATE["phones"]) == 1:
+            p = STATE["phones"][0]
+            connect(f"http://{p['ip']}:{p['port']}/video", p["name"])
+        elif not STATE["phones"]:
+            log("no phone found by scanning. That is fine: scan the QR above with the phone app, "
+                "or press Scan on the viewer page.", "WARN")
+        else:
+            log("several phones found -- connect them from the viewer page")
+
+    if a.auto_scan > 0 and not a.url:
+        threading.Thread(target=auto_scan_loop, args=(a.auto_scan,), daemon=True).start()
+        log(f"auto-scan on: new phones on this network connect by themselves (every {a.auto_scan}s)", debug_only=True)
+
+    try:
+        while True:
+            if a.window:  # imshow must run on the main thread
+                r = first_reader()
+                f = r.get()[0] if r else None
+                if f is not None:
+                    cv2.imshow("Runner Cam", f)
+                if cv2.waitKey(10) == 27:
+                    break
+            else:
+                time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        code = main()
+    except Exception:
+        log(f"fatal: {traceback.format_exc()}", "ERROR")
+        code = 1
+    if code and getattr(sys, "frozen", False):
+        input("\nStopped with an error (see above / connector_debug.log). Press Enter to close...")
+    sys.exit(code)

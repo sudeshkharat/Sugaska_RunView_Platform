@@ -1,0 +1,240 @@
+import re
+import uuid
+import json
+from datetime import datetime
+from typing import Optional
+from fastapi import APIRouter, HTTPException, Depends
+from app.connectors.state_db import StateDBConnector
+from app.queries import ProjectQueries
+from app.schemas.base import AppProjectCreate, AppProjectUpdate, AppProjectResponse, AppProjectDuplicate
+
+router = APIRouter(prefix="/apps", tags=["apps"])
+
+def get_db_connector():
+    connector = StateDBConnector()
+    try:
+        yield connector
+    finally:
+        pass # Let the connector handle its own connection pooling
+
+def parse_json_field(val, default):
+    if val is None: return default
+    if isinstance(val, (list, dict)): return val
+    try:
+        return json.loads(val)
+    except:
+        return default
+
+@router.get("", response_model=list[AppProjectResponse])
+def list_apps(db: StateDBConnector = Depends(get_db_connector)):
+    rows = db.execute_query(ProjectQueries.GET_ALL_PROJECTS)
+    # Ensure JSON fields are parsed for the response model
+    results = []
+    for row in rows:
+        app = dict(row)
+        app["model_asset_ids"] = parse_json_field(app.get("model_asset_ids"), [])
+        app["inspection_tasks"] = parse_json_field(app.get("inspection_tasks"), [])
+        app["canvas_state"] = parse_json_field(app.get("canvas_state"), [])
+        app["app_settings"] = parse_json_field(app.get("app_settings"), {})
+        results.append(app)
+    return results
+
+@router.post("", response_model=AppProjectResponse)
+def create_app(data: AppProjectCreate, db: StateDBConnector = Depends(get_db_connector)):
+    project_id = str(uuid.uuid4())
+    package_name = data.package_name
+    if not package_name:
+        slug = re.sub(r"[^a-z0-9]", "_", data.name.lower()) or "app"
+        # Java package segments can't start with a digit (e.g. "4x4_reverse").
+        if slug[0].isdigit():
+            slug = f"app_{slug}"
+        package_name = f"com.studio.{slug}"
+
+    app_settings = data.app_settings or {
+        "confidence_threshold": 0.5,
+        "show_labels": True,
+        "show_confidence": True,
+        "color_scheme": "dark",
+    }
+
+    params = {
+        "id": project_id,
+        "name": data.name,
+        "package_name": package_name,
+        "model_asset_id": data.model_asset_id,
+        "model_asset_ids": json.dumps(data.model_asset_ids or []),
+        "inspection_tasks": json.dumps(data.inspection_tasks or []),
+        "canvas_state": json.dumps([]),
+        "app_settings": json.dumps(app_settings),
+        "build_status": "idle",
+        "build_log": "",
+        "build_step": "",
+        "apk_path": ""
+    }
+    
+    db.execute_insert(ProjectQueries.INSERT_PROJECT, params)
+    
+    # Fetch and return the created project
+    rows = db.execute_query(ProjectQueries.GET_PROJECT_BY_ID, {"id": project_id})
+    if not rows:
+        raise HTTPException(status_code=500, detail="Failed to create project")
+    
+    app = dict(rows[0])
+    app["model_asset_ids"] = parse_json_field(app.get("model_asset_ids"), [])
+    app["inspection_tasks"] = parse_json_field(app.get("inspection_tasks"), [])
+    app["canvas_state"] = parse_json_field(app.get("canvas_state"), [])
+    app["app_settings"] = parse_json_field(app.get("app_settings"), {})
+    return app
+
+@router.get("/{app_id}", response_model=AppProjectResponse)
+def get_app(app_id: str, db: StateDBConnector = Depends(get_db_connector)):
+    rows = db.execute_query(ProjectQueries.GET_PROJECT_BY_ID, {"id": app_id})
+    if not rows:
+        raise HTTPException(status_code=404, detail="App project not found")
+    
+    app = dict(rows[0])
+    app["model_asset_ids"] = parse_json_field(app.get("model_asset_ids"), [])
+    app["inspection_tasks"] = parse_json_field(app.get("inspection_tasks"), [])
+    app["canvas_state"] = parse_json_field(app.get("canvas_state"), [])
+    app["app_settings"] = parse_json_field(app.get("app_settings"), {})
+    return app
+
+@router.post("/{app_id}/duplicate", response_model=AppProjectResponse)
+def duplicate_app(app_id: str, data: Optional[AppProjectDuplicate] = None, db: StateDBConnector = Depends(get_db_connector)):
+    rows = db.execute_query(ProjectQueries.GET_PROJECT_BY_ID, {"id": app_id})
+    if not rows:
+        raise HTTPException(status_code=404, detail="App project not found")
+
+    source = dict(rows[0])
+    data = data or AppProjectDuplicate()
+
+    new_name = data.name or f"{source['name']} (Copy)"
+    package_name = data.package_name
+    if not package_name:
+        slug = re.sub(r"[^a-z0-9]", "_", new_name.lower()) or "app"
+        if slug[0].isdigit():
+            slug = f"app_{slug}"
+        package_name = f"com.studio.{slug}"
+
+    project_id = str(uuid.uuid4())
+    params = {
+        "id": project_id,
+        "name": new_name,
+        "package_name": package_name,
+        "model_asset_id": source.get("model_asset_id"),
+        # Copy the source project's full config so the duplicate starts
+        # identical (models, mandatory/ignored classes, OCR config, canvas
+        # layout, settings) and only diverges from there -- that's the
+        # whole point, versus redoing every setup step from scratch.
+        "model_asset_ids": json.dumps(parse_json_field(source.get("model_asset_ids"), [])),
+        "inspection_tasks": json.dumps(parse_json_field(source.get("inspection_tasks"), [])),
+        "canvas_state": json.dumps(parse_json_field(source.get("canvas_state"), [])),
+        "app_settings": json.dumps(parse_json_field(source.get("app_settings"), {})),
+        "build_status": "idle",
+        "build_log": "",
+        "build_step": "",
+        "apk_path": ""
+    }
+
+    db.execute_insert(ProjectQueries.INSERT_PROJECT, params)
+
+    new_rows = db.execute_query(ProjectQueries.GET_PROJECT_BY_ID, {"id": project_id})
+    if not new_rows:
+        raise HTTPException(status_code=500, detail="Failed to duplicate project")
+
+    app = dict(new_rows[0])
+    app["model_asset_ids"] = parse_json_field(app.get("model_asset_ids"), [])
+    app["inspection_tasks"] = parse_json_field(app.get("inspection_tasks"), [])
+    app["canvas_state"] = parse_json_field(app.get("canvas_state"), [])
+    app["app_settings"] = parse_json_field(app.get("app_settings"), {})
+    return app
+
+@router.patch("/{app_id}", response_model=AppProjectResponse)
+def update_app(app_id: str, data: AppProjectUpdate, db: StateDBConnector = Depends(get_db_connector)):
+    rows = db.execute_query(ProjectQueries.GET_PROJECT_BY_ID, {"id": app_id})
+    if not rows:
+        raise HTTPException(status_code=404, detail="App project not found")
+    
+    app = dict(rows[0])
+    
+    # Parse existing JSON fields to avoid double-encoding
+    current_asset_ids = parse_json_field(app.get("model_asset_ids"), [])
+    current_tasks = parse_json_field(app.get("inspection_tasks"), [])
+    current_canvas = parse_json_field(app.get("canvas_state"), [])
+    current_settings = parse_json_field(app.get("app_settings"), {})
+
+    # Update fields — use incoming value when provided, fall back to current DB value
+    name = data.name if data.name is not None else app["name"]
+    package_name = data.package_name if data.package_name is not None else app["package_name"]
+    model_asset_id = data.model_asset_id if data.model_asset_id is not None else app.get("model_asset_id")
+    
+    model_asset_ids = data.model_asset_ids if data.model_asset_ids is not None else current_asset_ids
+    inspection_tasks = data.inspection_tasks if data.inspection_tasks is not None else current_tasks
+    canvas_state = data.canvas_state if data.canvas_state is not None else current_canvas
+    
+    app_settings = current_settings
+    if data.app_settings is not None:
+        app_settings = {**app_settings, **data.app_settings}
+
+    build_status = data.build_status if data.build_status is not None else app.get("build_status", "idle")
+    build_step = data.build_step if data.build_step is not None else app.get("build_step", "")
+    build_log = data.build_log if data.build_log is not None else app.get("build_log", "")
+
+    params = {
+        "id": app_id,
+        "name": name,
+        "package_name": package_name,
+        "model_asset_id": model_asset_id,
+        "model_asset_ids": json.dumps(model_asset_ids),
+        "inspection_tasks": json.dumps(inspection_tasks),
+        "canvas_state": json.dumps(canvas_state),
+        "app_settings": json.dumps(app_settings),
+        "build_status": build_status,
+        "build_log": build_log,
+        "build_step": build_step,
+        "apk_path": app.get("apk_path", "")
+    }
+
+    db.execute_update(ProjectQueries.UPDATE_PROJECT, params)
+    
+    updated_rows = db.execute_query(ProjectQueries.GET_PROJECT_BY_ID, {"id": app_id})
+    res = dict(updated_rows[0])
+    res["model_asset_ids"] = parse_json_field(res.get("model_asset_ids"), [])
+    res["inspection_tasks"] = parse_json_field(res.get("inspection_tasks"), [])
+    res["canvas_state"] = parse_json_field(res.get("canvas_state"), [])
+    res["app_settings"] = parse_json_field(res.get("app_settings"), {})
+    return res
+
+@router.delete("/{app_id}")
+def delete_app(app_id: str, db: StateDBConnector = Depends(get_db_connector)):
+    deleted = db.execute_update(ProjectQueries.DELETE_PROJECT, {"id": app_id})
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="App project not found")
+    return {"deleted": True}
+
+@router.post("/{app_id}/submit")
+def submit_inspection(app_id: str, data: dict, db: StateDBConnector = Depends(get_db_connector)):
+    """Receive and persist inspection results from the mobile app."""
+    result_id = str(uuid.uuid4())
+    params = {
+        "id": result_id,
+        "app_id": app_id,
+        "vin": data.get("vin", "UNKNOWN"),
+        "model_code": data.get("modelCode", "UNKNOWN"),
+        "results": json.dumps(data.get("results", [])),
+        "overall_success": data.get("overallSuccess", True),
+        "inspector_notes": data.get("notes", ""),
+    }
+    
+    from app.queries import ResultQueries
+    db.execute_insert(ResultQueries.INSERT_RESULT, params)
+    return {"id": result_id, "status": "success"}
+
+@router.get("/{app_id}/results")
+def list_results(app_id: str, db: StateDBConnector = Depends(get_db_connector)):
+    from app.queries import ResultQueries
+    rows = db.execute_query(ResultQueries.GET_RESULTS_BY_APP, {"app_id": app_id})
+    # Parse JSON results
+    for row in rows:
+        row["results"] = parse_json_field(row.get("results"), [])
+    return rows

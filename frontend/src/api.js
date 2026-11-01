@@ -1,0 +1,131 @@
+import axios from 'axios';
+
+// build.bat sets REACT_APP_API_URL=http://localhost:8002 when building the
+// EXE, since its bundled backend runs on 8002, not the 8001 used by local
+// `npm start` dev (paired with a separately-run `uvicorn --port 8001`).
+// This was previously hardcoded to :8001, so the built EXE's frontend
+// (served from :8002) called an API that was never running -- every
+// request failed as a generic browser "Network Error" with no server-side
+// trace at all, since it never left the browser.
+const API_BASE = (process.env.REACT_APP_API_URL || 'http://localhost:8001') + '/api/v1';
+const api = axios.create({ baseURL: API_BASE });
+
+/**
+ * Upload a .pt model file with its class list.
+ * @param {File}     file       The .pt file object
+ * @param {string}   modelName  Display name for this model
+ * @param {string[]} classes    Array of class name strings  e.g. ["dog","cat"]
+ * @param {number}   inputSize  Model input size (default 640)
+ * @param {string}   modelKind  'detector' (default) | 'detector_char_only' --
+ *                              the class-agnostic localization-only detector
+ *                              exported from ai-vision-platform's train-seed
+ *                              (class_agnostic=True); every box is a generic
+ *                              "char"/"plate" class with no character identity.
+ */
+export const uploadModel = (file, modelName, classes, inputSize = 640, modelKind = 'detector') => {
+  const form = new FormData();
+  form.append('file', file);
+  form.append('model_name', modelName);
+  form.append('classes', JSON.stringify(classes));
+  form.append('input_size', String(inputSize));
+  form.append('model_kind', modelKind);
+  return api.post('/models/upload', form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  });
+};
+
+/**
+ * Register an already-built OCR model bundle (a .tflite exported from
+ * ai-vision-platform's OCR trainer, plus its charset/labels sidecar and
+ * optional meta.json). Unlike uploadModel, this is NOT a .pt -- it's
+ * registered directly, no conversion queued.
+ * @param {File}   tfliteFile  The .tflite file
+ * @param {File}   charsetFile charset.txt / labels.txt sidecar
+ * @param {string} modelName   Display name for this model
+ * @param {string} modelKind   'detector' | 'ocr_cnn' | 'ocr_crnn'
+ * @param {File}   [metaFile]  optional meta.json sidecar
+ */
+export const uploadOcrModel = (tfliteFile, charsetFile, modelName, modelKind, metaFile) => {
+  const form = new FormData();
+  form.append('tflite_file', tfliteFile);
+  form.append('charset_file', charsetFile);
+  form.append('model_name', modelName);
+  form.append('model_kind', modelKind);
+  if (metaFile) form.append('meta_file', metaFile);
+  return api.post('/models/upload-ocr', form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  });
+};
+
+export const extractClasses = (file) => {
+  const form = new FormData();
+  form.append('file', file);
+  return api.post('/models/extract-classes', form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  });
+};
+
+export const getModels      = ()         => api.get('/models');
+export const getModelStatus = (id) => api.get(`/models/${id}/status`);
+export const detectModelClasses = (id) => api.post(`/models/${id}/detect-classes`);
+export const replaceModelPt = (id, file) => {
+  const form = new FormData();
+  form.append('file', file);
+  return api.post(`/models/${id}/replace-pt`, form, { headers: { 'Content-Type': 'multipart/form-data' } });
+};
+export const deleteModel = (id) => api.delete(`/models/${id}`);
+export const downloadModelPt = (id) =>
+  api.get(`/models/${id}/download-pt`, { responseType: 'blob' });
+
+
+export const getApps    = ()         => api.get('/apps');
+export const createApp = (data) => {
+  console.log('API: Creating app with data:', data);
+  return api.post('/apps', data);
+};
+export const getApp     = (id)       => api.get(`/apps/${id}`);
+export const updateApp = (id, data) => {
+  console.log(`API: Updating app ${id} with data:`, data);
+  return api.patch(`/apps/${id}`, data);
+};
+export const deleteApp  = (id)       => api.delete(`/apps/${id}`);
+export const duplicateApp = (id, data) => api.post(`/apps/${id}/duplicate`, data || {});
+
+export const exportApp = (id) =>
+  api.post(`/apps/${id}/export`, {}, { responseType: 'blob' });
+
+export const buildAPK = (id) => api.post(`/apps/${id}/build`);
+
+export const downloadAPK = (id) =>
+  api.get(`/apps/${id}/apk`, { responseType: 'blob' });
+
+export const downloadPcPack = (id) =>
+  api.get(`/apps/${id}/pc-export`, { responseType: 'blob' });
+
+// ── Reference Images ─────────────────────────────────────────────────────────
+export const uploadReferenceImage = (file) => {
+  const form = new FormData();
+  form.append('file', file);
+  return api.post('/assets/reference-image', form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  });
+};
+export const getReferenceImageUrl = (filename) =>
+  `http://localhost:8001/api/v1/assets/reference-image/${filename}`;
+
+// ── Master Data ──────────────────────────────────────────────────────────────
+export const getMasterMappings = () => api.get('/master-data');
+export const createMasterMapping = (data) => api.post('/master-data', data);
+export const updateMasterMapping = (id, data) => api.put(`/master-data/${id}`, data);
+export const deleteMasterMapping = (id) => api.delete(`/master-data/${id}`);
+
+// ── Engine Data ──────────────────────────────────────────────────────────────
+export const getEngineMappings = () => api.get('/engine-data');
+export const createEngineMapping = (data) => api.post('/engine-data', data);
+export const updateEngineMapping = (id, data) => api.put(`/engine-data/${id}`, data);
+export const deleteEngineMapping = (id) => api.delete(`/engine-data/${id}`);
+export const importEngineMappings = (rows) => api.post('/engine-data/import', rows);
+
+export const importMasterMappings = (rows) => api.post('/master-data/import', rows);
+
+export default api;

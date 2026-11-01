@@ -1,0 +1,435 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import '../ml/detector.dart';
+import '../services/camera_prefs.dart';
+import '../services/sync_service.dart';
+import 'sync_screen.dart';
+
+const _crimson = Color(0xFFDC143C);
+
+/// App settings: sending data to the PC / shop WiFi, TFLite CPU threads (used by
+/// both the photo and the live inspection) and camera autofocus. Everything is
+/// remembered on the phone and applied the next time a camera / model starts.
+class SettingsScreen extends StatefulWidget {
+  const SettingsScreen({super.key});
+
+  /// Fixed password for all apps (also documented in the README).
+  static const String password = 'Ajai@12345';
+
+  @override
+  State<SettingsScreen> createState() => _SettingsScreenState();
+}
+
+class _SettingsScreenState extends State<SettingsScreen> {
+  int _threads = 0;
+  bool _autofocus = false;
+  bool _debugDl = false;
+  bool _unlocked = false;
+  final TextEditingController _pw = TextEditingController();
+  bool _pwWrong = false;
+  bool _pwHide = true;
+  bool _vibrate = true;
+  bool _sound = true;
+  String? _toneOk;
+  String? _toneNotOk;
+  int _unsynced = 0;
+  int _liveTimeout = 45;
+  List<String> _taskNames = [];
+  Set<String> _liveTasks = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final t = await CameraPrefs.getThreads();
+    final af = await CameraPrefs.getAutofocus();
+    final dd = await CameraPrefs.getDebugDownload();
+    final vb = await ResultFeedback.getVibrate();
+    final sd = await ResultFeedback.getSound();
+    final tOk = await ResultFeedback.getCustomTone('ok');
+    final tNo = await ResultFeedback.getCustomTone('notOk');
+    final n = await SyncService.instance.getUnsyncedCount();
+    final live = await CameraPrefs.getLiveTasks();
+    final lt = await CameraPrefs.getLiveTimeoutSeconds();
+    final names = await _loadTaskNames();
+    if (mounted) setState(() { _threads = t; _autofocus = af; _debugDl = dd; _vibrate = vb; _sound = sd; _toneOk = tOk; _toneNotOk = tNo; _unsynced = n; _liveTasks = live; _liveTimeout = lt; _taskNames = names; });
+  }
+
+  /// Every task name of this app (from the bundled manifest), in order, without duplicates.
+  Future<List<String>> _loadTaskNames() async {
+    try {
+      final manifest = json.decode(await rootBundle.loadString('assets/models_manifest.json'));
+      final names = <String>[];
+      if (manifest is List) {
+        for (final t in manifest) {
+          final n = t is Map ? t['name'] : null;
+          if (n is String && !names.contains(n)) names.add(n);
+        }
+      }
+      return names;
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<void> _setLive(String name, bool live) async {
+    setState(() { live ? _liveTasks.add(name) : _liveTasks.remove(name); });
+    await CameraPrefs.setLiveTasks(_liveTasks);
+  }
+
+  Future<void> _setAllLive(bool live) async {
+    setState(() { _liveTasks = live ? _taskNames.toSet() : <String>{}; });
+    await CameraPrefs.setLiveTasks(_liveTasks);
+  }
+
+  Future<void> _setThreads(int t) async {
+    setState(() => _threads = t);
+    await CameraPrefs.setThreads(t);
+    await ModelManager().setCpuThreads(t);
+  }
+
+  @override
+  void dispose() {
+    _idle?.cancel();
+    _pw.dispose();
+    super.dispose();
+  }
+
+  // Locks again after a minute without touching the screen.
+  Timer? _idle;
+  void _touch() {
+    _idle?.cancel();
+    if (!_unlocked) return;
+    _idle = Timer(const Duration(minutes: 1), () {
+      if (mounted) setState(() { _unlocked = false; _pw.clear(); });
+    });
+  }
+
+  void _tryUnlock() {
+    if (_pw.text == SettingsScreen.password) {
+      setState(() { _unlocked = true; _pwWrong = false; });
+      _touch();
+    } else {
+      setState(() => _pwWrong = true);
+    }
+  }
+
+  Widget _lockScreen() {
+    return Scaffold(
+      backgroundColor: const Color(0xFFF7F7F7),
+      appBar: AppBar(
+        backgroundColor: _crimson,
+        foregroundColor: Colors.white,
+        title: const Text('Settings', style: TextStyle(fontWeight: FontWeight.bold)),
+      ),
+      body: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(24),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 360),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.lock, size: 48, color: _crimson),
+                const SizedBox(height: 12),
+                const Text('Settings are password protected', style: TextStyle(fontWeight: FontWeight.w600)),
+                const SizedBox(height: 16),
+                TextField(
+                  controller: _pw,
+                  obscureText: _pwHide,
+                  autofocus: true,
+                  onSubmitted: (_) => _tryUnlock(),
+                  decoration: InputDecoration(
+                    labelText: 'Password',
+                    errorText: _pwWrong ? 'Wrong password' : null,
+                    border: const OutlineInputBorder(),
+                    suffixIcon: IconButton(
+                      icon: Icon(_pwHide ? Icons.visibility : Icons.visibility_off),
+                      onPressed: () => setState(() => _pwHide = !_pwHide),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    style: ElevatedButton.styleFrom(backgroundColor: _crimson, foregroundColor: Colors.white),
+                    onPressed: _tryUnlock,
+                    child: const Text('Unlock'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_unlocked) return _lockScreen();
+    final int cores = Platform.numberOfProcessors;
+    final options = <int>[0, 2, 4, 6, 8].where((t) => t == 0 || t <= cores).toList();
+    return Listener(
+      behavior: HitTestBehavior.translucent,
+      onPointerDown: (_) => _touch(),
+      onPointerMove: (_) => _touch(),
+      child: Scaffold(
+      backgroundColor: const Color(0xFFF7F7F7),
+      appBar: AppBar(
+        backgroundColor: _crimson,
+        foregroundColor: Colors.white,
+        title: const Text('Settings', style: TextStyle(fontWeight: FontWeight.bold)),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.wifi, color: _crimson),
+              title: const Text('PC & WiFi', style: TextStyle(fontWeight: FontWeight.w600)),
+              subtitle: Text(_unsynced > 0
+                  ? '$_unsynced inspection(s) waiting to be sent'
+                  : 'Pair a PC, shop WiFi, send data'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () async {
+                await Navigator.push(context, MaterialPageRoute(builder: (_) => const SyncScreen()));
+                _load();
+              },
+            ),
+          ),
+          const SizedBox(height: 8),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('CPU threads (detection)', style: TextStyle(fontWeight: FontWeight.w600)),
+                  const SizedBox(height: 4),
+                  Text('Photo and live inspection. Auto uses ${ModelManager.cpuThreads == 0 ? ModelManager.effectiveThreads() : 'the chosen number of'} of $cores cores.',
+                      style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    children: [
+                      for (final t in options)
+                        ChoiceChip(
+                          label: Text(t == 0 ? 'Auto' : '$t'),
+                          selected: _threads == t,
+                          selectedColor: _crimson.withOpacity(0.2),
+                          onSelected: (_) => _setThreads(t),
+                        ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Live inspection tasks', style: TextStyle(fontWeight: FontWeight.w600)),
+                  const SizedBox(height: 4),
+                  const Text('Tasks switched on use live video detection after the VIN scan; the others use photo detection. The video icon on the task screen still opens live for testing.',
+                      style: TextStyle(fontSize: 12, color: Colors.grey)),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    children: [
+                      OutlinedButton(onPressed: _taskNames.isEmpty ? null : () => _setAllLive(true), child: const Text('All live')),
+                      OutlinedButton(onPressed: _taskNames.isEmpty ? null : () => _setAllLive(false), child: const Text('All photo')),
+                    ],
+                  ),
+                  if (_taskNames.isEmpty)
+                    const Padding(padding: EdgeInsets.only(top: 8), child: Text('No tasks found in this app.', style: TextStyle(color: Colors.grey))),
+                  for (final n in _taskNames)
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      dense: true,
+                      title: Text(n),
+                      subtitle: Text(_liveTasks.contains(n) ? 'Live video' : 'Photo'),
+                      value: _liveTasks.contains(n),
+                      activeColor: _crimson,
+                      onChanged: (v) => _setLive(n, v),
+                    ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(children: [
+                    const Expanded(child: Text('Live inspection timer', style: TextStyle(fontWeight: FontWeight.w600))),
+                    Text('$_liveTimeout s', style: const TextStyle(fontWeight: FontWeight.bold, color: _crimson)),
+                  ]),
+                  const SizedBox(height: 4),
+                  const Text('How long live inspection looks for the part before it decides on the last frame. Default 45 s.',
+                      style: TextStyle(fontSize: 12, color: Colors.grey)),
+                  Slider(
+                    min: 10,
+                    max: 180,
+                    divisions: 34,
+                    value: _liveTimeout.clamp(10, 180).toDouble(),
+                    label: '$_liveTimeout s',
+                    activeColor: _crimson,
+                    onChanged: (v) => setState(() => _liveTimeout = v.round()),
+                    onChangeEnd: (v) => CameraPrefs.setLiveTimeoutSeconds(v.round()),
+                  ),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton(
+                      onPressed: () async {
+                        setState(() => _liveTimeout = 45);
+                        await CameraPrefs.setLiveTimeoutSeconds(45);
+                      },
+                      child: const Text('Reset to 45 s'),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Card(
+            child: SwitchListTile(
+              secondary: const Icon(Icons.center_focus_strong, color: _crimson),
+              title: const Text('Autofocus', style: TextStyle(fontWeight: FontWeight.w600)),
+              subtitle: const Text('Photo inspection. Off = camera works as before. Live always uses autofocus.'),
+              value: _autofocus,
+              activeColor: _crimson,
+              onChanged: (v) async {
+                setState(() => _autofocus = v);
+                await CameraPrefs.setAutofocus(v);
+              },
+            ),
+          ),
+          const SizedBox(height: 8),
+          Card(
+            child: SwitchListTile(
+              secondary: const Icon(Icons.bug_report, color: _crimson),
+              title: const Text('Download debug log', style: TextStyle(fontWeight: FontWeight.w600)),
+              subtitle: const Text('Off by default. On = after every inspection a small .txt debug log (with CPU cores and phone heat) is saved to Pictures/MAI/<app>/DebugLogs.'),
+              value: _debugDl,
+              activeColor: _crimson,
+              onChanged: (v) async {
+                setState(() => _debugDl = v);
+                await CameraPrefs.setDebugDownload(v);
+              },
+            ),
+          ),
+          const SizedBox(height: 8),
+          Card(
+            child: Column(
+              children: [
+                SwitchListTile(
+                  secondary: const Icon(Icons.vibration, color: _crimson),
+                  title: const Text('Result vibration', style: TextStyle(fontWeight: FontWeight.w600)),
+                  subtitle: const Text('Strong buzz: OK 1, NOT OK 2, not found 3'),
+                  value: _vibrate,
+                  activeColor: _crimson,
+                  onChanged: (v) async {
+                    setState(() => _vibrate = v);
+                    await ResultFeedback.setVibrate(v);
+                    if (v) ResultFeedback.play('notFound');
+                  },
+                ),
+                SwitchListTile(
+                  secondary: const Icon(Icons.volume_up, color: _crimson),
+                  title: const Text('Result sound', style: TextStyle(fontWeight: FontWeight.w600)),
+                  subtitle: const Text('Loud tone per result (plays on the alarm volume)'),
+                  value: _sound,
+                  activeColor: _crimson,
+                  onChanged: (v) async {
+                    setState(() => _sound = v);
+                    await ResultFeedback.setSound(v);
+                    if (v) ResultFeedback.play('ok');
+                  },
+                ),
+                _toneRow('OK sound', 'ok', _toneOk),
+                _toneRow('NOT OK sound', 'notOk', _toneNotOk),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                  child: Wrap(
+                    spacing: 8,
+                    children: [
+                      OutlinedButton(
+                          onPressed: () async {
+                            await ResultFeedback.play('ok');
+                            if (!mounted) return;
+                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                                content: Text(ResultFeedback.lastDiag.isEmpty ? 'No vibration info' : ResultFeedback.lastDiag)));
+                          },
+                          child: const Text('Test OK')),
+                      OutlinedButton(
+                          onPressed: () async {
+                            await ResultFeedback.play('notOk');
+                            if (!mounted) return;
+                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                                content: Text(ResultFeedback.lastDiag.isEmpty ? 'No vibration info' : ResultFeedback.lastDiag)));
+                          },
+                          child: const Text('Test NOT OK')),
+                      OutlinedButton(onPressed: () => ResultFeedback.play('notFound'), child: const Text('Test not found')),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+      ),
+    );
+  }
+
+  /// One row: which sound is used for this result, with Choose / Test / Reset.
+  Widget _toneRow(String title, String slot, String? value) {
+    final String? name = value?.split('|').last;
+    return ListTile(
+      dense: true,
+      leading: const Icon(Icons.music_note, color: _crimson),
+      title: Text(title, style: const TextStyle(fontWeight: FontWeight.w600)),
+      subtitle: Text(name ?? 'Default tone', maxLines: 1, overflow: TextOverflow.ellipsis),
+      trailing: Wrap(
+        children: [
+          IconButton(
+            tooltip: 'Choose an audio file',
+            icon: const Icon(Icons.folder_open),
+            onPressed: () async {
+              final r = await ResultFeedback.pickTone(slot);
+              if (r != null) {
+                _load();
+                ResultFeedback.play(slot);
+              }
+            },
+          ),
+          if (value != null)
+            IconButton(
+              tooltip: 'Back to default tone',
+              icon: const Icon(Icons.restore),
+              onPressed: () async {
+                await ResultFeedback.setCustomTone(slot, null);
+                _load();
+              },
+            ),
+        ],
+      ),
+    );
+  }
+}

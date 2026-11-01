@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+websockets
+pyinstaller
+# inspector (YOLO .pt on CPU). Install the CPU-only torch first to keep the exe small:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+ultralytics
+opencv-python
+numpy

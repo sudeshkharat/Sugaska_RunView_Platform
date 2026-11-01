@@ -1,0 +1,714 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
+import 'dart:typed_data';
+import 'package:archive/archive.dart';
+import 'package:crypto/crypto.dart';
+import 'package:flutter/services.dart' show rootBundle, MethodChannel;
+import 'package:http/http.dart' as http;
+import 'package:multicast_dns/multicast_dns.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import '../database/database.dart';
+
+/// mDNS service type the PC receiver app advertises on the LAN. Discovery
+/// only ever sees devices on the same WiFi/hotspot -- it does not reach
+/// outside the local network.
+const String kSyncServiceType = '_flutteraisync._tcp';
+
+/// Folder name this app's data is grouped under on the PC (alongside the
+/// phone's name), so multiple generated apps sending to the same PC don't
+/// mix their data together.
+const String kAppFolderName = '{{ app_name_slug }}';
+
+class DiscoveredPc {
+  final String name;
+  final String ip;
+  final int port;
+  const DiscoveredPc({required this.name, required this.ip, required this.port});
+}
+
+/// A PC this phone has completed the one-time QR pairing handshake with.
+/// [secret] is only ever known to this phone and that PC -- it's what lets
+/// the PC reject data from any other device on the network.
+class PairedPc {
+  final String deviceId;
+  final String name;
+  String ip;
+  int port;
+  final String secret;
+
+  PairedPc({
+    required this.deviceId,
+    required this.name,
+    required this.ip,
+    required this.port,
+    required this.secret,
+  });
+
+  Map<String, dynamic> toJson() =>
+      {'deviceId': deviceId, 'name': name, 'ip': ip, 'port': port, 'secret': secret};
+
+  factory PairedPc.fromJson(Map<String, dynamic> j) => PairedPc(
+        deviceId: j['deviceId'] as String,
+        name: j['name'] as String,
+        ip: j['ip'] as String,
+        port: j['port'] as int,
+        secret: j['secret'] as String,
+      );
+}
+
+class SyncResult {
+  final bool success;
+  final String message;
+  final int sentCount;
+  const SyncResult(this.success, this.message, {this.sentCount = 0});
+}
+
+class _ExportBundle {
+  final Uint8List zipBytes;
+  final List<int> inspectionIds;
+  const _ExportBundle(this.zipBytes, this.inspectionIds);
+}
+
+class SyncService {
+  static final SyncService instance = SyncService._();
+  SyncService._();
+
+  static const _kPairedDevicesKey = 'synced_pc_devices';
+  static const _kDeviceLabelKey = 'sync_device_label';
+  static const _kInstallIdKey = 'sync_install_id';
+
+  // The paired-PC list (including each PC's per-phone secret) and the
+  // install id below deliberately live in plain SharedPreferences, not
+  // flutter_secure_storage / the Android Keystore-backed encrypted store
+  // this used to use. That store has a well-known failure mode on Android
+  // (worse on some OEMs, e.g. Samsung): its encryption key can become
+  // invalidated by the OS independently of anything the app does -- no
+  // reinstall, no uninstall, nothing the user did wrong -- and the stored
+  // values then silently come back empty, which looks exactly like
+  // "paired PC vanished" days after it was last working fine. A reinstall
+  // still wipes SharedPreferences too, same as before, but that's an
+  // explicit, expected action -- not a background OS quirk. The PC-issued
+  // secret is a locally-scoped bearer token for this one phone/PC pair,
+  // not a password or anything else that justifies trading reliability for
+  // OS-level encryption at rest.
+
+  /// A random id generated once for this app install and persisted
+  /// alongside the paired-PC list. Unlike the human-typed device label --
+  /// which two different phones can easily end up sharing -- this can't
+  /// collide, so the receiver uses it (not the label) to tell "is this
+  /// really the same phone pairing again" apart from "a different phone
+  /// that happens to have the same name".
+  Future<String> _getOrCreateInstallId() async {
+    final prefs = await SharedPreferences.getInstance();
+    final existing = prefs.getString(_kInstallIdKey);
+    if (existing != null && existing.isNotEmpty) return existing;
+    final rand = Random.secure();
+    final id = List<int>.generate(16, (_) => rand.nextInt(256))
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join();
+    await prefs.setString(_kInstallIdKey, id);
+    return id;
+  }
+
+  // ── This phone's display name (e.g. "Sudesh") ───────────────────────────
+  // Shown on the PC's paired-device list and used as the top-level folder
+  // name under which this phone's data is saved, so multiple phones sending
+  // to the same PC land in clearly separate folders.
+
+  Future<String?> getDeviceLabel() async {
+    final prefs = await SharedPreferences.getInstance();
+    final v = prefs.getString(_kDeviceLabelKey);
+    return (v == null || v.trim().isEmpty) ? null : v.trim();
+  }
+
+  Future<void> setDeviceLabel(String label) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kDeviceLabelKey, label.trim());
+  }
+
+  // Some Android OEMs (and stock Android with the screen off / radio idle)
+  // drop incoming WiFi multicast packets -- including mDNS responses --
+  // unless something on the device is holding a multicast lock. Without it,
+  // discovery below can silently come back empty on some phones and not
+  // others purely based on screen/power state at that moment, which looks
+  // exactly like "some phones' APKs are fine, some aren't" when it's
+  // actually the same code failing to even hear the PC's reply.
+  static const _multicastChannel = MethodChannel('{{ package_name }}/multicast_lock');
+
+  /// Discover PC receivers advertising on the local network via mDNS.
+  Future<List<DiscoveredPc>> discoverPcs({Duration timeout = const Duration(seconds: 4)}) async {
+    final client = MDnsClient();
+    final found = <String, DiscoveredPc>{};
+    try {
+      try {
+        await _multicastChannel.invokeMethod('acquire');
+      } catch (_) {
+        // Non-Android platform, or the native side isn't wired up for some
+        // reason -- discovery just runs with whatever the OS defaults to.
+      }
+      await client.start();
+      await for (final ptr in client
+          .lookup<PtrResourceRecord>(ResourceRecordQuery.serverPointer('$kSyncServiceType.local'))
+          .timeout(timeout, onTimeout: (sink) => sink.close())) {
+        await for (final srv in client
+            .lookup<SrvResourceRecord>(ResourceRecordQuery.service(ptr.domainName))
+            .timeout(const Duration(seconds: 2), onTimeout: (sink) => sink.close())) {
+          await for (final ip in client
+              .lookup<IPAddressResourceRecord>(ResourceRecordQuery.addressIPv4(srv.target))
+              .timeout(const Duration(seconds: 2), onTimeout: (sink) => sink.close())) {
+            final name = ptr.domainName.split('.').first;
+            found[srv.target] = DiscoveredPc(name: name, ip: ip.address.address, port: srv.port);
+          }
+        }
+      }
+    } catch (_) {
+      // mDNS blocked/unsupported on this network -- caller falls back to the
+      // last known IP for already-paired PCs, or manual QR pairing.
+    } finally {
+      client.stop();
+      try {
+        await _multicastChannel.invokeMethod('release');
+      } catch (_) {}
+    }
+    return found.values.toList();
+  }
+
+  Future<List<PairedPc>> getPairedPcs() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_kPairedDevicesKey);
+    if (raw == null || raw.isEmpty) return [];
+    final list = jsonDecode(raw) as List;
+    return list.map((e) => PairedPc.fromJson(e as Map<String, dynamic>)).toList();
+  }
+
+  Future<void> _savePairedPcs(List<PairedPc> devices) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kPairedDevicesKey, jsonEncode(devices.map((d) => d.toJson()).toList()));
+  }
+
+  Future<void> removePairedPc(String deviceId) async {
+    final devices = await getPairedPcs();
+    devices.removeWhere((d) => d.deviceId == deviceId);
+    await _savePairedPcs(devices);
+  }
+
+  /// Complete one-time pairing using the JSON payload scanned from the QR
+  /// code the PC receiver shows on screen: {name, ip, port, token}. The
+  /// token is single-use and expires PC-side after a few minutes, so a
+  /// screenshot of an old QR code can't be replayed later to pair a
+  /// different phone.
+  Future<PairedPc> pairFromQrData(String qrRaw) async {
+    final data = jsonDecode(qrRaw) as Map<String, dynamic>;
+    final ip = data['ip'] as String;
+    final port = data['port'] as int;
+    final pcName = data['name'] as String? ?? 'PC';
+    final token = data['token'] as String;
+
+    final deviceLabel = await getDeviceLabel() ?? _fallbackDeviceLabel();
+    final installId = await _getOrCreateInstallId();
+
+    final resp = await http
+        .post(
+          Uri.parse('http://$ip:$port/pair'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'token': token,
+            'deviceName': deviceLabel,
+            'appName': kAppFolderName,
+            'installId': installId,
+          }),
+        )
+        .timeout(const Duration(seconds: 10));
+
+    if (resp.statusCode != 200) {
+      throw Exception('Pairing rejected by PC (${resp.statusCode}): ${resp.body}');
+    }
+    final body = jsonDecode(resp.body) as Map<String, dynamic>;
+    final paired = PairedPc(
+      deviceId: body['deviceId'] as String,
+      name: pcName,
+      ip: ip,
+      port: port,
+      secret: body['secret'] as String,
+    );
+
+    final devices = await getPairedPcs();
+    devices.removeWhere((d) => d.name == pcName && d.ip == ip);
+    devices.add(paired);
+    await _savePairedPcs(devices);
+    return paired;
+  }
+
+  String _fallbackDeviceLabel() =>
+      'phone-${DateTime.now().millisecondsSinceEpoch.toRadixString(36)}';
+
+  // ── Liveness heartbeat ──────────────────────────────────────────────────
+  // A no-data ping sent every [_kHeartbeatInterval] while this app is open
+  // and a PC is paired, completely separate from actual inspection uploads.
+  // Without this, the PC (and the read-only viewer) can only infer "is this
+  // phone still connected" from when data last arrived -- which looks
+  // identical for "connected fine, nothing new to send in the last hour"
+  // and "dropped off WiFi 20 minutes ago". This gives an honest, roughly
+  // real-time signal instead.
+  static const Duration _kHeartbeatInterval = Duration(seconds: 45);
+  Timer? _heartbeatTimer;
+
+  /// Starts the periodic heartbeat loop. Safe to call more than once --
+  /// an existing timer is cancelled first so this never ends up running
+  /// two loops in parallel. Runs for as long as the app process is alive;
+  /// there is deliberately no background-service variant of this (the app
+  /// is expected to stay open on the inspection line), so a heartbeat gap
+  /// while the app is fully backgrounded/killed is expected, not a bug.
+  void startHeartbeatLoop() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = Timer.periodic(_kHeartbeatInterval, (_) => _pingAllPairedPcs());
+    unawaited(_pingAllPairedPcs()); // don't wait a full interval for the first one
+  }
+
+  void stopHeartbeatLoop() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
+  }
+
+  Future<void> _pingAllPairedPcs() async {
+    final devices = await getPairedPcs();
+    for (final pc in devices) {
+      // Best-effort and independent per PC -- one unreachable/rejecting PC
+      // must never stop pinging the others, and a failure here must never
+      // surface to the UI (this has nothing to do with whether sending
+      // data itself succeeds).
+      try {
+        await _sendHeartbeat(pc);
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _sendHeartbeat(PairedPc pc) async {
+    final timestamp = DateTime.now().millisecondsSinceEpoch.toString();
+    final signaturePayload = '${pc.deviceId}:$timestamp';
+    final signature =
+        Hmac(sha256, utf8.encode(pc.secret)).convert(utf8.encode(signaturePayload)).toString();
+
+    final uri = Uri.parse('http://${pc.ip}:${pc.port}/heartbeat');
+    await http.post(
+      uri,
+      headers: {
+        'X-Device-Id': pc.deviceId,
+        'X-Timestamp': timestamp,
+        'X-Signature': signature,
+      },
+    ).timeout(const Duration(seconds: 8));
+  }
+
+  Future<int> getUnsyncedCount() => db.countUnsyncedInspections();
+
+  /// Marks this phone's entire local history unsynced, then sends it all to
+  /// [pc]. Use this when the sync state can't be trusted -- e.g. after
+  /// re-pairing following an app reinstall (which wipes the local "already
+  /// synced" flags along with everything else), or if inspections seem to
+  /// be missing on the PC -- instead of the normal send, which only pushes
+  /// what's currently flagged new. Safe to run even if some of this data
+  /// already reached the PC before: the receiver deduplicates incoming
+  /// rows by VIN/date/time/task, so already-received ones are dropped
+  /// there rather than duplicated.
+  Future<SyncResult> resyncAll(PairedPc pc) async {
+    await db.resetAllSyncStatus();
+    return sendToPc(pc);
+  }
+
+  /// Sends any not-yet-uploaded inspections to the first paired PC, if any
+  /// is paired. Intended to be called automatically right after a
+  /// submission (mirrors auto-print) -- returns null (no-op, no error to
+  /// surface) if no PC has ever been paired yet. With a large backlog
+  /// [sendToPc] can now take a while (it walks the whole backlog in
+  /// batches) -- a fast run of submissions would otherwise each fire their
+  /// own overlapping call here, so callers should go through the
+  /// [sendToPc] in-flight guard rather than assume this always starts a
+  /// fresh send.
+  Future<SyncResult?> autoSendIfPaired() async {
+    final devices = await getPairedPcs();
+    if (devices.isEmpty) return null;
+    return sendToPc(devices.first);
+  }
+
+  // Guards against two sends racing each other for the same PC -- e.g. the
+  // auto-send fired after a submission still working through a large
+  // backlog when the next vehicle is submitted and fires another one, or
+  // the user tapping "Send" while an auto-send is already running. Without
+  // this, concurrent sendToPc calls each build their own batch from
+  // whatever is still flagged unsynced at that instant and upload it
+  // independently -- not corrupting anything (the PC dedupes), but wasting
+  // bandwidth and racing each other to mark the same rows synced. A caller
+  // that arrives while one is already running just waits on that same
+  // send's result instead of starting a second one.
+  final Map<String, Future<SyncResult>> _inFlightSends = {};
+
+  // How many inspections (rows + all their photos) go into one export/
+  // upload, starting point. A phone can accumulate thousands of unsynced
+  // inspections (e.g. after being unable to reach the PC for a while) --
+  // exporting and uploading *all* of them as a single zip in one request
+  // gets big enough, slow enough that it either blows past the PC's 60s
+  // upload timeout or exhausts the phone's memory building the zip, so
+  // tapping Send simply fails every time and the backlog never moves.
+  // Sending in small bounded batches, each marked synced as soon as the PC
+  // confirms it, makes a huge backlog progress steadily instead of needing
+  // to succeed all at once. See _sendToPcImpl for how this shrinks further
+  // on a genuinely unstable connection.
+  static const int _kSyncBatchSize = 20;
+  static const int _kMinSyncBatchSize = 1;
+
+  /// Exports inspections not yet confirmed received by [pc] (database rows
+  /// + their images) in bounded batches (see [_kSyncBatchSize]), uploading
+  /// each with an HMAC-signed request and marking only that batch synced
+  /// once the PC confirms receipt, then moving on to the next batch until
+  /// nothing unsynced is left. Already-synced inspections are never
+  /// re-sent. Local data is never deleted or modified by a failed batch --
+  /// it simply stays flagged unsynced, and everything sent in earlier
+  /// batches this run stays sent, so a mid-run failure loses no progress.
+  Future<SyncResult> sendToPc(PairedPc pc) {
+    final existing = _inFlightSends[pc.deviceId];
+    if (existing != null) return existing;
+    final future = _sendToPcImpl(pc).whenComplete(() {
+      _inFlightSends.remove(pc.deviceId);
+      // Best-effort housekeeping after every sync attempt (not just
+      // successful ones -- a prior run's synced backlog may already be
+      // over the limit) -- never awaited so it can't slow down reporting
+      // the sync result back to the UI.
+      unawaited(_enforceCacheLimit());
+      unawaited(_deleteSyncedNegativeImages());
+    });
+    _inFlightSends[pc.deviceId] = future;
+    return future;
+  }
+
+  // Local image "cache" here is the compressed backup copy kept under
+  // '<app support dir>/inspection_backups/...' as a fallback for the
+  // primary copy in the phone's public Pictures gallery (see
+  // inspection_camera_screen.dart's backup-save step). Once an inspection
+  // is confirmed synced, the PC already has the
+  // full-quality image, so that backup copy is expendable -- deleting the
+  // oldest synced ones first keeps the app's own storage bounded instead
+  // of growing forever over months of scanning.
+  static const int _kMaxCacheBytes = 50 * 1024 * 1024;
+
+  Future<void> _enforceCacheLimit() async {
+    try {
+      final appDir = await getApplicationSupportDirectory();
+      final backupDir = Directory('${appDir.path}/inspection_backups');
+      if (!await backupDir.exists()) return;
+
+      int total = 0;
+      await for (final entity in backupDir.list(recursive: true, followLinks: false)) {
+        if (entity is File) total += await entity.length();
+      }
+      if (total <= _kMaxCacheBytes) return;
+
+      final candidates = await db.getSyncedBackupImages();
+      for (final c in candidates) {
+        if (total <= _kMaxCacheBytes) break;
+        final file = File(c.path);
+        if (await file.exists()) {
+          total -= await file.length();
+          try {
+            await file.delete();
+          } catch (_) {
+            continue; // couldn't delete -- leave its DB path intact and move on
+          }
+        }
+        await db.clearBackupImagePath(c.taskResultId);
+      }
+    } catch (_) {
+      // Best-effort housekeeping -- a failure here must never affect sync.
+    }
+  }
+
+  // Unlike the compressed backup cache (kept up to _kMaxCacheBytes as a
+  // sync fallback), the full-quality negative-dataset copy has no reason to
+  // stay on the phone at all once its inspection is confirmed synced -- the
+  // PC's negative_dataset copy is now the one that matters for training, so
+  // every synced negative image is deleted, not just the oldest ones over a
+  // limit.
+  Future<void> _deleteSyncedNegativeImages() async {
+    try {
+      final candidates = await db.getSyncedNegativeImages();
+      for (final c in candidates) {
+        final file = File(c.path);
+        if (await file.exists()) {
+          try {
+            await file.delete();
+          } catch (_) {
+            continue; // couldn't delete -- leave its DB path intact and move on
+          }
+        }
+        await db.clearNegativeImagePath(c.taskResultId);
+      }
+    } catch (_) {
+      // Best-effort housekeeping -- a failure here must never affect sync.
+    }
+  }
+
+  Future<SyncResult> _sendToPcImpl(PairedPc pc) async {
+    // Refresh the PC's current LAN IP once up front (in case DHCP changed
+    // it since pairing) rather than before every batch -- with hundreds of
+    // batches that mDNS lookup alone would add minutes to the send.
+    try {
+      final discovered = await discoverPcs(timeout: const Duration(seconds: 2));
+      final match = discovered.where((d) => d.name == pc.name);
+      if (match.isNotEmpty) {
+        pc.ip = match.first.ip;
+        pc.port = match.first.port;
+        final devices = await getPairedPcs();
+        final idx = devices.indexWhere((d) => d.deviceId == pc.deviceId);
+        if (idx != -1) {
+          devices[idx] = pc;
+          await _savePairedPcs(devices);
+        }
+      }
+    } catch (_) {
+      // Discovery is best-effort -- fall back to the last known IP.
+    }
+
+    int totalSent = 0;
+    // Shrinks when a batch fails to connect/complete, so one unstable
+    // stretch of WiFi doesn't stall the whole backlog behind a batch that's
+    // simply too big to finish before the connection drops -- observed in
+    // practice as the PC repeatedly logging "disconnected before
+    // completing" for the same batch size over and over. Grows back up
+    // gradually after a run of successes, so a connection that recovers
+    // doesn't stay stuck sending one record at a time for the rest of a
+    // long backlog.
+    int batchSize = _kSyncBatchSize;
+    while (true) {
+      final bundle = await _buildExportBundle(limit: batchSize);
+      if (bundle.inspectionIds.isEmpty) {
+        if (totalSent == 0) {
+          return const SyncResult(true, 'Already up to date -- nothing to send.');
+        }
+        return SyncResult(true, 'Sent $totalSent inspection(s) to PC.', sentCount: totalSent);
+      }
+
+      try {
+        final timestamp = DateTime.now().millisecondsSinceEpoch.toString();
+        final bodyHash = sha256.convert(bundle.zipBytes).toString();
+        final signaturePayload = '${pc.deviceId}:$timestamp:$bodyHash';
+        final signature =
+            Hmac(sha256, utf8.encode(pc.secret)).convert(utf8.encode(signaturePayload)).toString();
+
+        final uri = Uri.parse('http://${pc.ip}:${pc.port}/upload');
+        final request = http.MultipartRequest('POST', uri)
+          ..headers['X-Device-Id'] = pc.deviceId
+          ..headers['X-Timestamp'] = timestamp
+          ..headers['X-Signature'] = signature
+          ..files.add(http.MultipartFile.fromBytes('data', bundle.zipBytes,
+              filename: 'inspection_export.zip'));
+
+        final streamed = await request.send().timeout(const Duration(seconds: 60));
+        final resp = await http.Response.fromStream(streamed);
+
+        if (resp.statusCode == 200) {
+          await db.markInspectionsSynced(bundle.inspectionIds);
+          totalSent += bundle.inspectionIds.length;
+          if (batchSize < _kSyncBatchSize) {
+            batchSize = (batchSize + 4).clamp(_kMinSyncBatchSize, _kSyncBatchSize);
+          }
+          continue; // more may be left -- go around for the next batch
+        }
+        if (resp.statusCode == 401) {
+          // The PC returns 401 for three different reasons (unknown device,
+          // expired/clock-skewed signature, bad signature) -- show its actual
+          // detail instead of one generic phrase, since "not paired" and
+          // "your clock is wrong" need completely different fixes. Not a
+          // connection/size problem, so retrying smaller wouldn't help --
+          // stop here same as before.
+          String reason = 'not paired with that PC';
+          try {
+            final body = jsonDecode(resp.body) as Map<String, dynamic>;
+            if (body['detail'] != null) reason = body['detail'].toString();
+          } catch (_) {}
+          return SyncResult(false,
+              totalSent > 0 ? 'Sent $totalSent, then rejected by PC: $reason' : 'Rejected by PC: $reason',
+              sentCount: totalSent);
+        }
+        return SyncResult(false,
+            totalSent > 0
+                ? 'Sent $totalSent, then the PC rejected the upload (${resp.statusCode}).'
+                : 'PC rejected the upload (${resp.statusCode}).',
+            sentCount: totalSent);
+      } on TimeoutException {
+        if (batchSize > _kMinSyncBatchSize) {
+          batchSize = (batchSize / 2).ceil().clamp(_kMinSyncBatchSize, _kSyncBatchSize);
+          continue; // retry the same (still-unsynced) records at a smaller size
+        }
+        return SyncResult(
+            false,
+            totalSent > 0
+                ? 'Sent $totalSent, then timed out -- tap Send again to continue.'
+                : "Timed out -- is the PC on this WiFi/hotspot and the receiver running?",
+            sentCount: totalSent);
+      } catch (e) {
+        // Covers a dropped/reset connection mid-upload (the phone's WiFi
+        // wobbling, not the PC rejecting anything) -- same shrink-and-retry
+        // as a timeout, since it's the same underlying problem: this batch
+        // was too much for the connection to push through in one go.
+        if (batchSize > _kMinSyncBatchSize) {
+          batchSize = (batchSize / 2).ceil().clamp(_kMinSyncBatchSize, _kSyncBatchSize);
+          continue;
+        }
+        return SyncResult(
+            false,
+            totalSent > 0 ? 'Sent $totalSent, then failed: $e' : 'Send failed: $e',
+            sentCount: totalSent);
+      }
+    }
+  }
+
+  // Same A/B/C shift windows used by the History screen, so the PC-side
+  // data matches what the inspector sees on the phone.
+  String _shiftFor(DateTime dt) {
+    final mins = dt.hour * 60 + dt.minute;
+    if (mins >= 420 && mins < 930) return 'A';
+    if (mins >= 930) return 'B';
+    return 'C';
+  }
+
+  // Shift Date is always the scan's own plain calendar date -- Shift A and
+  // B on a given day, and Shift C (00:00-07:00, the next calendar day after
+  // that day's B) all keep their own actual date, with no rollback onto the
+  // previous day.
+  String _shiftDateFor(DateTime dt) {
+    return '${dt.year.toString().padLeft(4, '0')}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')}';
+  }
+
+  /// Maps model/engine code -> human-readable name using the same lookup
+  /// data already bundled for VIN/engine-code scanning, so the PC side gets
+  /// a readable name without needing its own copy of the master data.
+  Future<Map<String, String>> _loadModelNameMap() async {
+    try {
+{% if scan_type == 'engine' %}
+      final raw = await rootBundle.loadString('assets/engine_data.json');
+      final List<dynamic> data = jsonDecode(raw);
+      return {
+        for (final e in data)
+          (e['part_no'] as String? ?? '').toUpperCase(): (e['model_name'] as String? ?? ''),
+      };
+{% else %}
+      final raw = await rootBundle.loadString('assets/master_data.json');
+      final List<dynamic> data = jsonDecode(raw);
+      return {
+        for (final e in data)
+          (e['model_code'] as String? ?? '').toUpperCase(): (e['platform_name'] as String? ?? ''),
+      };
+{% endif %}
+    } catch (_) {
+      return {};
+    }
+  }
+
+  // Master data only tags a variant (e.g. "(V1)", "[V2]") inside the free-text
+  // description for some model families -- others (Scorpio, Thar, ...) don't
+  // use this convention at all, so a miss here just means "no variant on
+  // record" rather than a guess.
+  static final RegExp _variantPattern = RegExp(r'[\(\[]\s*(V\d+)\s*[\)\]]', caseSensitive: false);
+
+  String _extractVariant(String description) {
+    final match = _variantPattern.firstMatch(description);
+    return match?.group(1)?.toUpperCase() ?? '';
+  }
+
+  /// Maps model code -> variant extracted from that model's description in
+  /// the same bundled master data, so the PC side can show "which variant"
+  /// alongside the model name without a separate lookup table.
+  Future<Map<String, String>> _loadModelVariantMap() async {
+{% if scan_type == 'engine' %}
+    return {};
+{% else %}
+    try {
+      final raw = await rootBundle.loadString('assets/master_data.json');
+      final List<dynamic> data = jsonDecode(raw);
+      return {
+        for (final e in data)
+          (e['model_code'] as String? ?? '').toUpperCase():
+              _extractVariant(e['description'] as String? ?? ''),
+      };
+    } catch (_) {
+      return {};
+    }
+{% endif %}
+  }
+
+  Future<_ExportBundle> _buildExportBundle({int? limit}) async {
+    final archive = Archive();
+    final unsynced = await db.getUnsyncedInspections(limit: limit);
+    final manifest = <Map<String, dynamic>>[];
+    final seenImagePaths = <String>{};
+    final modelNames = await _loadModelNameMap();
+    final modelVariants = await _loadModelVariantMap();
+
+    for (final insp in unsynced) {
+      final results = await db.getResultsForInspection(insp.id);
+      final taskList = <Map<String, dynamic>>[];
+
+      for (final r in results) {
+        String? zipImagePath;
+        String? zipBackupPath;
+        String? zipNegativePath;
+        for (final entry in [
+          (r.imagePath, 'images', (String p) => zipImagePath = p),
+          (r.backupImagePath, 'images', (String p) => zipBackupPath = p),
+          // Negative-dataset copies go under a separate top-level folder so
+          // the PC receiver can tell them apart from ordinary result photos
+          // without needing to inspect manifest.json first.
+          (r.negativeImagePath, 'negatives', (String p) => zipNegativePath = p),
+        ]) {
+          final path = entry.$1;
+          if (path == null || path.isEmpty) continue;
+          final f = File(path);
+          final arcName = '${entry.$2}/${f.uri.pathSegments.last}';
+          if (await f.exists()) {
+            if (!seenImagePaths.contains(path)) {
+              seenImagePaths.add(path);
+              final bytes = await f.readAsBytes();
+              archive.addFile(ArchiveFile(arcName, bytes.length, bytes));
+            }
+            entry.$3(arcName);
+          }
+        }
+
+        taskList.add({
+          'taskName': r.taskName,
+          'className': r.className,
+          'success': r.success,
+          'imagePath': zipImagePath,
+          'backupImagePath': zipBackupPath,
+          'negativeImagePath': zipNegativePath,
+          'timestamp': r.timestamp.toIso8601String(),
+        });
+      }
+
+      final dt = insp.createdAt;
+      manifest.add({
+        'inspectionId': insp.id,
+        'vin': insp.vin,
+        'modelCode': insp.modelCode,
+        'modelName': modelNames[insp.modelCode.toUpperCase()] ?? '',
+        'modelVariant': modelVariants[insp.modelCode.toUpperCase()] ?? '',
+        'createdAt': dt.toIso8601String(),
+        'date': '${dt.year.toString().padLeft(4, '0')}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')}',
+        'time': '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}:${dt.second.toString().padLeft(2, '0')}',
+        'shift': _shiftFor(dt),
+        'shiftDate': _shiftDateFor(dt),
+        'tasks': taskList,
+      });
+    }
+
+    final manifestBytes = utf8.encode(jsonEncode(manifest));
+    archive.addFile(ArchiveFile('manifest.json', manifestBytes.length, manifestBytes));
+
+    final zipped = ZipEncoder().encode(archive);
+    return _ExportBundle(
+        Uint8List.fromList(zipped ?? const []), unsynced.map((e) => e.id).toList());
+  }
+}

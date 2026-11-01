@@ -1,0 +1,21 @@
+name: runner_cam
+description: Runner Cam - turns the phone camera into a CCTV-style feed for the PC runner (like IP Webcam).
+publish_to: "none"
+version: 0.2.0
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  camera: ^0.10.6
+  web_socket_channel: ^2.4.0
+  wakelock_plus: ^1.2.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true

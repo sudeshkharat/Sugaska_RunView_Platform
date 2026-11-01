@@ -1,0 +1,151 @@
+import 'dart:ui';
+import 'package:image/image.dart' as img;
+
+class DetectionResult {
+  final String className;
+  final double confidence;
+  final Rect bbox; // normalized 0.0–1.0 coordinates (x, y, w, h)
+  final String? ocrText;
+  final bool? isOcrMatch;
+  // Per-engine reads, kept alongside the final [ocrText] rather than folded
+  // into it. When the trained recognizer's read misses and ML Kit runs as a
+  // fallback, ML Kit's text becomes ocrText -- which used to silently
+  // discard what the recognizer actually read, the single most useful thing
+  // to see when a read goes wrong. Both are retained now so the result
+  // screen can show them side by side, the way the standalone OCR screen
+  // always has. Null means that engine didn't run for this detection.
+  final String? ocrCrnnText;
+  final String? ocrMlKitText;
+  // Per-character detections inside this region, only populated by the CNN
+  // (per-character TensorFlow classifier) engine -- each entry's className
+  // is the *predicted character*, not a detector class name, and its bbox
+  // is the original character box the main detector found. Lets the result
+  // screen overlay individual character boxes/confidences on the photo,
+  // the same breakdown the training tool's CNN test panel shows, instead of
+  // only ever surfacing the joined [ocrText] string. Null for every other
+  // engine (crnn/mlkit), which have no per-character boxes to show.
+  final List<DetectionResult>? ocrCharBoxes;
+  // Outline of the segmented object (normalized 0-1 image coords), only set
+  // by segment-task models; null means draw the plain bbox.
+  final List<Offset>? polygon;
+  // Region classifier (e.g. Max_reg -> locked / unlocked), only set for a class
+  // configured with "Classify region". classifierLabel is the winning label, or
+  // 'uncertain' when its confidence is below the class's minimum. isClassifierPass is
+  // true for the configured pass label at/above that confidence, false for any other
+  // confident label, and null when unsure ('uncertain') or when no classifier ran.
+  // All three are null for every other detection, and for history saved before this existed.
+  final String? classifierLabel;
+  final double? classifierConfidence;
+  final bool? isClassifierPass;
+
+  const DetectionResult({
+    required this.className,
+    required this.confidence,
+    required this.bbox,
+    this.ocrText,
+    this.isOcrMatch,
+    this.ocrCrnnText,
+    this.ocrMlKitText,
+    this.ocrCharBoxes,
+    this.polygon,
+    this.classifierLabel,
+    this.classifierConfidence,
+    this.isClassifierPass,
+  });
+
+  DetectionResult copyWith({
+    String? ocrText,
+    bool? isOcrMatch,
+    String? ocrCrnnText,
+    String? ocrMlKitText,
+    List<DetectionResult>? ocrCharBoxes,
+    List<Offset>? polygon,
+    String? classifierLabel,
+    double? classifierConfidence,
+    bool? isClassifierPass,
+  }) => DetectionResult(
+    className: className,
+    confidence: confidence,
+    bbox: bbox,
+    ocrText: ocrText ?? this.ocrText,
+    isOcrMatch: isOcrMatch ?? this.isOcrMatch,
+    ocrCrnnText: ocrCrnnText ?? this.ocrCrnnText,
+    ocrMlKitText: ocrMlKitText ?? this.ocrMlKitText,
+    ocrCharBoxes: ocrCharBoxes ?? this.ocrCharBoxes,
+    polygon: polygon ?? this.polygon,
+    classifierLabel: classifierLabel ?? this.classifierLabel,
+    classifierConfidence: classifierConfidence ?? this.classifierConfidence,
+    isClassifierPass: isClassifierPass ?? this.isClassifierPass,
+  );
+
+  Map<String, dynamic> toJson() => {
+    'className': className,
+    'confidence': confidence,
+    'bbox': {
+      'left': bbox.left,
+      'top': bbox.top,
+      'right': bbox.right,
+      'bottom': bbox.bottom,
+    },
+    'ocrText': ocrText,
+    'isOcrMatch': isOcrMatch,
+    'ocrCrnnText': ocrCrnnText,
+    'ocrMlKitText': ocrMlKitText,
+    'ocrCharBoxes': ocrCharBoxes?.map((c) => c.toJson()).toList(),
+    'polygon': polygon?.map((o) => [o.dx, o.dy]).toList(),
+    'classifierLabel': classifierLabel,
+    'classifierConfidence': classifierConfidence,
+    'isClassifierPass': isClassifierPass,
+  };
+
+  static DetectionResult fromJson(Map<String, dynamic> json) => DetectionResult(
+    className: json['className'] as String,
+    confidence: (json['confidence'] as num).toDouble(),
+    bbox: Rect.fromLTRB(
+      (json['bbox']['left'] as num).toDouble(),
+      (json['bbox']['top'] as num).toDouble(),
+      (json['bbox']['right'] as num).toDouble(),
+      (json['bbox']['bottom'] as num).toDouble(),
+    ),
+    ocrText: json['ocrText'] as String?,
+    isOcrMatch: json['isOcrMatch'] as bool?,
+    // Absent in rows saved before these fields existed -- null is the
+    // correct "this engine didn't run" value, so old history still loads.
+    ocrCrnnText: json['ocrCrnnText'] as String?,
+    ocrMlKitText: json['ocrMlKitText'] as String?,
+    ocrCharBoxes: (json['ocrCharBoxes'] as List?)
+        ?.map((c) => DetectionResult.fromJson(Map<String, dynamic>.from(c as Map)))
+        .toList(),
+    polygon: (json['polygon'] as List?)
+        ?.map((p) => Offset((p[0] as num).toDouble(), (p[1] as num).toDouble()))
+        .toList(),
+    // Absent in rows saved before the classifier existed.
+    classifierLabel: json['classifierLabel'] as String?,
+    classifierConfidence: (json['classifierConfidence'] as num?)?.toDouble(),
+    isClassifierPass: json['isClassifierPass'] as bool?,
+  );
+
+  /// Burns [polygon] into [image] as a closed outline (saved / uploaded
+  /// annotated photos are drawn with package:image, not the screen painter).
+  /// No-op for detect-model results.
+  static void drawPolygonOnImage(img.Image image, List<Offset>? polygon, img.Color color) {
+    if (polygon == null || polygon.length < 3) return;
+    final w = image.width.toDouble();
+    final h = image.height.toDouble();
+    for (int i = 0; i < polygon.length; i++) {
+      final a = polygon[i];
+      final b = polygon[(i + 1) % polygon.length];
+      img.drawLine(image,
+          x1: (a.dx * w).round().clamp(0, image.width - 1),
+          y1: (a.dy * h).round().clamp(0, image.height - 1),
+          x2: (b.dx * w).round().clamp(0, image.width - 1),
+          y2: (b.dy * h).round().clamp(0, image.height - 1),
+          color: color,
+          thickness: 3);
+    }
+  }
+
+  @override
+  String toString() =>
+      'DetectionResult(class=$className, conf=${confidence.toStringAsFixed(2)}, bbox=$bbox, ocr=$ocrText, match=$isOcrMatch)';
+}

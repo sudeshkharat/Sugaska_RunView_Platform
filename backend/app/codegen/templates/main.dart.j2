@@ -1,0 +1,69 @@
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:camera/camera.dart';
+import 'services/sync_service.dart';
+import 'services/wifi_service.dart';
+import 'screens/home_screen.dart';
+{% if is_combined_app %}
+import 'screens/capability_menu_screen.dart';
+{% else %}
+import 'screens/scan_screen.dart';
+{% endif %}
+{% if is_ocr_app and not is_combined_app %}import 'screens/ocr_scan_screen.dart';
+{% endif %}
+
+List<CameraDescription> cameras = [];
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  cameras = await availableCameras();
+  // Best-effort liveness ping to any paired PC, independent of actual data
+  // uploads -- lets the PC/viewer show "Online" based on real recent
+  // reachability instead of only "when did data last arrive".
+  SyncService.instance.startHeartbeatLoop();
+  // Best-effort: join the configured shop WiFi automatically every time the
+  // app opens, same as this device would auto-reconnect a paired Bluetooth
+  // printer. Never awaited -- must not delay getting to the scan screen if
+  // WiFi is slow, off, or out of range.
+  unawaited(WifiService.instance.ensureConnected());
+  // A build error used to leave a blank / grey screen with no clue. Show the real error instead, so it can be reported.
+  ErrorWidget.builder = (FlutterErrorDetails d) => Material(
+        color: Colors.white,
+        child: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: SingleChildScrollView(
+              child: Text('Something went wrong on this screen. Go back and try again.\n\n${d.exceptionAsString()}',
+                  style: const TextStyle(color: Colors.red, fontSize: 12)),
+            ),
+          ),
+        ),
+      );
+  runApp(const MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: '{{ app_name }}',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFFDC143C),
+          brightness: Brightness.light,
+        ),
+        useMaterial3: true,
+        scaffoldBackgroundColor: Colors.white,
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Color(0xFFDC143C),
+          foregroundColor: Colors.white,
+          elevation: 0,
+        ),
+      ),
+      home: {% if is_combined_app %}CapabilityMenuScreen(cameras: cameras){% elif is_ocr_app and ocr_truth_source == 'qr' %}ScanScreen(modelCode: '', cameras: cameras){% elif is_ocr_app and ocr_truth_source == 'type' %}OcrScanScreen(cameras: cameras, truthValue: '{{ ocr_truth_text | default("", true) }}'){% elif is_ocr_app %}OcrScanScreen(cameras: cameras){% elif app_type == 'sequential' %}const ScanScreen(modelCode: '{{ app_settings.model_code }}'){% else %}HomeScreen(cameras: cameras){% endif %},
+    );
+  }
+}
